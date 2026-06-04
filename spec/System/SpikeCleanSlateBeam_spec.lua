@@ -97,6 +97,61 @@ describe("CleanSlate: beam reallocation", function()
 		print(string.format("\nClass: %s   Budget P = %d normal points", spec.curClassName, P))
 		print(string.format("Current tree score=%.1f  dps=%.1f  ehp=%.1f", curScore, curDps, curEhp))
 
+		-- ---- ACCELERATED CALCULATOR (SPIKE_ACCEL) ----------------------------------------
+		-- The default calcFunc (getMiscCalculator) runs a FULL calcs.initEnv + perform on EVERY
+		-- call: it re-parses items, gem requirements, and the skill list each time, even though
+		-- in this search ONLY node allocation changes (gear/gems/skills/config are fixed). That
+		-- per-call rebuild is the throughput blocker (~4.7 ms/call -> ~30 min for a P=74 diet).
+		--
+		-- The engine already supports skipping those phases via initEnv's `accelerate` table
+		-- (see calcs.calcFullDPS at Calcs.lua:308, which reuses one env across FullDPS skills).
+		-- Here we build a calculator that holds ONE persistent env and, per call, re-inits with
+		-- accelerate = { requirementsItems, requirementsGems, skills }. We deliberately leave
+		-- nodeAlloc=false because node allocation DOES change each call (that's the whole search).
+		--
+		-- CORRECTNESS RISK: accelerate.skills skips skill-list regeneration. If a CANDIDATE node
+		-- grants an active skill (node.grantedSkills, CalcSetup.lua:1376), it may not come online,
+		-- which would matter for a tree-granted-skill build. The DIAG re-score sanity check below
+		-- (must reproduce the live build's 956.6/2323.7) is exactly what validates this: if the
+		-- accelerated path drifts, that assert fails and we know skills=true is unsafe here.
+		local useAccel = os.getenv("SPIKE_ACCEL") == "1"
+		local accelCalcFunc, accelCalcBase
+		if useAccel then
+			local calcs = build.calcsTab.calcs
+			-- Build the base env ONCE (non-accelerated), mirroring getMiscCalculator's setup so
+			-- the cached parent DBs and FullDPS roll-up are established.
+			local env, cachedPlayerDB, cachedEnemyDB, cachedMinionDB = calcs.initEnv(build, "CALCULATOR")
+			calcs.perform(env)
+			local baseFullDPS = calcs.calcFullDPS(build, "CALCULATOR", {},
+				{ cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
+			local usedFullDPS = #baseFullDPS.skills > 0
+			if usedFullDPS then
+				env.player.output.SkillDPS = baseFullDPS.skills
+				env.player.output.FullDPS = baseFullDPS.combinedDPS
+				env.player.output.FullDotDPS = baseFullDPS.TotalDotDPS
+			end
+			accelCalcBase = env.player.output
+			-- Per-call accelerate set: skip item/gem/skill rebuilds, keep node-alloc rebuild.
+			local accel = { requirementsItems = true, requirementsGems = true, skills = true }
+			accelCalcFunc = function(override, useFullDPS)
+				calcs.initEnv(build, "CALCULATOR", override,
+					{ cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB,
+					  cachedMinionDB = cachedMinionDB, env = env, accelerate = accel })
+				env.override = override
+				calcs.perform(env)
+				if (useFullDPS ~= false or build.viewMode == "TREE") and usedFullDPS then
+					-- Force a fresh FullDPS roll-up so deltas aren't cache-zeroed (Calcs.lua:139).
+					local fullDPS = calcs.calcFullDPS(build, "CALCULATOR", override,
+						{ cachedPlayerDB = cachedPlayerDB, cachedEnemyDB = cachedEnemyDB, cachedMinionDB = cachedMinionDB, env = nil })
+					env.player.output.SkillDPS = fullDPS.skills
+					env.player.output.FullDPS = fullDPS.combinedDPS
+					env.player.output.FullDotDPS = fullDPS.TotalDotDPS
+				end
+				return env.player.output
+			end
+			print("ACCEL: using accelerated calculator (skip item/gem/skill rebuild per call)")
+		end
+
 		-- removeNodes = everything currently allocated EXCEPT the class start, so clean-slate
 		-- evals start from just the start node.
 		local removeCurrent = {}
@@ -109,12 +164,82 @@ describe("CleanSlate: beam reallocation", function()
 		-- nodes table by id; helper to fetch node objects
 		local nodes = spec.nodes
 
-		-- Score a candidate set (table of node objects) from clean slate.
-		local calls = 0
+		-- Score a candidate set (table of node objects) from clean slate. Uses the accelerated
+		-- calculator when SPIKE_ACCEL=1, else the default getMiscCalculator closure.
+		local evalFunc = useAccel and accelCalcFunc or calcFunc
+
+		-- CALL-COUNT REDUCTION (SPIKE_MEMO, default on): memoize the score of a candidate node-set
+		-- by an order-independent signature of its node ids. Since `perform` is the irreducible
+		-- ~8 ms floor, the only big throughput lever is evaluating fewer DISTINCT sets. Different
+		-- beam members (overlapping frontiers) and successive diet rounds frequently produce the
+		-- SAME resulting set; without memoization each pays a full perform. The cache persists for
+		-- the whole spike. Keyed by sorted-id signature so {A,B} and {B,A} collapse. Tracks hits.
+		local useMemo = os.getenv("SPIKE_MEMO") ~= "0"
+		local scoreMemo = {}
+		local calls, memoHits = 0, 0
+		local function sigOf(nodeObjSet)
+			local ids = {}
+			for n in pairs(nodeObjSet) do ids[#ids+1] = n.id end
+			table.sort(ids)
+			return table.concat(ids, ",")
+		end
 		local function scoreSet(nodeObjSet)
+			if useMemo then
+				local sig = sigOf(nodeObjSet)
+				local hit = scoreMemo[sig]
+				if hit then memoHits = memoHits + 1; return hit[1], hit[2], hit[3] end
+				calls = calls + 1
+				local s, d, e = scoreOf(evalFunc({ addNodes = nodeObjSet, removeNodes = removeCurrent }, true))
+				scoreMemo[sig] = { s, d, e }
+				return s, d, e
+			end
 			calls = calls + 1
-			local out = calcFunc({ addNodes = nodeObjSet, removeNodes = removeCurrent }, true)
-			return scoreOf(out)
+			return scoreOf(evalFunc({ addNodes = nodeObjSet, removeNodes = removeCurrent }, true))
+		end
+
+		-- ---- ACCEL MICRO-BENCHMARK + CORRECTNESS DIFF (SPIKE_ACCEL=1) --------------------
+		-- Before the long diet, time both calculators on the SAME candidate set (the live
+		-- build's current allocation) and confirm they agree. This isolates the speedup and
+		-- the correctness of the accelerate path from the search, so a regression is obvious.
+		if useAccel then
+			local benchSet = { [nodes[startId]] = true }
+			for id, node in pairs(spec.allocNodes) do
+				if not node.ascendancyName then benchSet[node] = true end
+			end
+			local N = tonumber(os.getenv("SPIKE_BENCH_N")) or 50
+			-- Report MIN ms/call over the run, not mean: the container is shared/noisy and the
+			-- minimum is the cleanest estimate of the actual per-call cost (no scheduler jitter).
+			local function timeFunc(fn, useFull)
+				fn({ addNodes = benchSet, removeNodes = removeCurrent }, useFull) -- warm-up
+				local best = math.huge
+				local lastDps, lastEhp
+				for _ = 1, N do
+					local t0 = os.clock()
+					local out = fn({ addNodes = benchSet, removeNodes = removeCurrent }, useFull)
+					local dt = (os.clock() - t0) * 1000
+					if dt < best then best = dt end
+					lastDps = out.FullDPS or out.TotalDPS or 0
+					lastEhp = out.TotalEHP or 0
+				end
+				return best, lastDps, lastEhp
+			end
+			local defMs, defDps, defEhp = timeFunc(calcFunc, true)
+			local accMs, accDps, accEhp = timeFunc(accelCalcFunc, true)
+			local accNfMs, accNfDps, accNfEhp = timeFunc(accelCalcFunc, false)
+			local defNfMs = timeFunc(calcFunc, false)
+			print(string.format("\n=== ACCEL MICRO-BENCHMARK (N=%d evals, MIN ms/call) ===", N))
+			print(string.format("  default calcFunc (FullDPS) : %.3f ms/call   dps=%.1f ehp=%.1f", defMs, defDps, defEhp))
+			print(string.format("  accel   calcFunc (FullDPS) : %.3f ms/call   dps=%.1f ehp=%.1f", accMs, accDps, accEhp))
+			print(string.format("  default calcFunc (NoFull)  : %.3f ms/call", defNfMs))
+			print(string.format("  accel   calcFunc (NoFull)  : %.3f ms/call   dps=%.1f ehp=%.1f", accNfMs, accNfDps, accNfEhp))
+			print(string.format("  speedup accel(FullDPS) vs default(FullDPS) : %.2fx", defMs / math.max(accMs, 1e-9)))
+			local dpsDiff = math.abs(defDps - accDps)
+			local ehpDiff = math.abs(defEhp - accEhp)
+			if dpsDiff > math.max(1, 0.01 * math.abs(defDps)) or ehpDiff > math.max(1, 0.01 * math.abs(defEhp)) then
+				print(string.format("  !! WARNING: accel disagrees with default (dDps=%.2f dEhp=%.2f). accelerate.skills may be unsafe for this build.", dpsDiff, ehpDiff))
+			else
+				print("  accel matches default within 1% — accelerate path is correct for this build.")
+			end
 		end
 
 		-- excludeSet: node ids the search must never allocate. This is the CURRENTLY ACTIVE
@@ -570,6 +695,14 @@ describe("CleanSlate: beam reallocation", function()
 			print(string.format("  %5d | %6.1f | %6.1f | %6.1f | %s",
 				ri - 1, r.score, r.dps, r.ehp, r.effectiveExclude and #r.effectiveExclude > 0
 					and ("excl: " .. tostring(#r.effectiveExclude)) or "(unconstrained)"))
+		end
+
+		-- ---- throughput summary ----------------------------------------------------------
+		if useMemo then
+			local total = calls + memoHits
+			print(string.format("\n=== THROUGHPUT === %d distinct evals + %d memo hits = %d total scoreSet (%.0f%% cached)%s",
+				calls, memoHits, total, total > 0 and (memoHits / total * 100) or 0,
+				useAccel and ", accel ON" or ""))
 		end
 
 		-- ---- mandatory build-enabler report ---------------------------------------------

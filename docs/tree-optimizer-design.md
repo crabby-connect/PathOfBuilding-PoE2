@@ -218,6 +218,50 @@ The optimizer does a **clean-slate reallocation**, not "what to add next":
 > most defensible result and the algorithm is now stable. Remaining blockers: **throughput**
 > (~190s/round × 8 = the 30-min cost is too slow for a dialog) and the still-unbuilt UI.
 
+> **THROUGHPUT — MEASURED, REDIRECTS THE STRATEGY (2026-06-04).** The per-call cost is
+> dominated by `calcs.perform`, which is **irreducible**: it must run every call because the
+> candidate's node mods changed. Cheaper-call optimizations barely move it — the win must come
+> from **fewer calls, not cheaper calls.** Measured on `mymonk.xml`, N=200, MIN ms/call (via a
+> `SPIKE_ACCEL=1` benchmark added to `SpikeCleanSlateBeam_spec.lua`):
+> | calculator path | ms/call | note |
+> | --- | --- | --- |
+> | default `getMiscCalculator` (FullDPS) | 10.0 | baseline |
+> | **accelerated env-reuse (FullDPS)** | **8.8** | only **1.14×** |
+> | default (useFullDPS=false) | 8.2 | FullDPS roll-up ≈ 1.8 ms |
+> | accel + NoFull | ~8.3 | **~1.2× combined — NOT the 5-10× needed** |
+>
+> The **accelerated calculator** holds ONE persistent env and per call re-inits with
+> `accelerate = { requirementsItems = true, requirementsGems = true, skills = true }` (keeping
+> `nodeAlloc = false`, since node alloc is exactly what changes). This skips item/gem/skill
+> **re-parse** — which turned out to be a *small* slice. The engine already uses this internally
+> (`Calcs.lua:308` `accelerationTbl`; honored by `initEnv`'s `accelerate` table,
+> `CalcSetup.lua:343+`). **Correctness: the accel path reproduces 956.6/2323.7 exactly**, so it
+> is safe for this build (no candidate node grants a skill that `accelerate.skills` would drop —
+> but that risk is real for tree-granted-skill builds and must be re-checked per build).
+> `useFullDPS=false` is safe for mymonk because its main skill *is* the FullDPS skill
+> (`TotalDPS ≈ FullDPS`); multi-skill/FullDPS builds still need the roll-up or DPS deltas read 0
+> (cache caveat, `Calcs.lua:139`).
+>
+> **CONCLUSION — the §4 lever ranking below (accel > skip-FullDPS > caching > beam) was wrong.**
+> `perform` is the ~8 ms floor; accel+NoFull is a flat ~1.2× and that's it. The only levers with
+> 5-10× headroom **reduce the call count**: smaller beam width, jump-candidate caps, frontier /
+> Pareto pruning, a cross-step set cache, and fewer diet rounds. Apply accel+NoFull anyway
+> (it's a free ~1.2× and the accel calculator is the right production primitive), but treat
+> **call-count reduction as the real throughput work.**
+
+> **CALL-COUNT MEMO — IMPLEMENTED + VALIDATED (2026-06-04, `SPIKE_MEMO`, default on).** First
+> call-count lever, landed in the spike: `scoreSet` memoizes the score by an **order-independent
+> sorted-id signature** of the candidate node-set. Overlapping beam frontiers and successive diet
+> rounds keep re-producing the *same* resulting set; the cache collapses those to one `perform`.
+> Memoizing by the concrete set is independent of the active `excludeSet` (exclusions gate move
+> *generation*, not the calc of a fixed set), so it's valid across diet rounds. **Validated:**
+> memo on vs off give byte-identical results (depth-15 beam-8: 130.5 / 196.9 / 2553.0 both ways,
+> all sanity asserts still pass). Measured **40 % hit rate** (1521 logical evals → 916 performs).
+> **Stacked: accel+NoFull (~1.2× cheaper-call) × memo (~1.67× fewer-call) ≈ 1.7–1.9× overall.**
+> Still short of a snappy dialog; remaining call-count levers (tighter beam, jump caps, Pareto
+> pruning, fewer rounds) are the next work. Spike flags added: `SPIKE_ACCEL`, `SPIKE_MEMO`,
+> `SPIKE_BENCH_N`.
+
 **In scope (v1):**
 - Objective: `score = wDPS * FullDPS + wEHP * TotalEHP` with user-set weights, plus a
   Pareto frontier so hybrid solutions aren't discarded.
