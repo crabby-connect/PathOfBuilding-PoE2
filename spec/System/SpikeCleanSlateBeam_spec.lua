@@ -277,13 +277,57 @@ describe("CleanSlate: beam reallocation", function()
 		end
 
 		-- ---- Beam state -----------------------------------------------------------------
-		-- A state = { ids = set of allocated ids (incl start), set = node-object set, score }
+		-- A state = { ids = set of allocated ids (incl start), set = node-object set, score, dps,
+		-- ehp }. dps/ehp are carried so the beam can prune by Pareto domination, not just scalar
+		-- score (SPIKE_PARETO).
 		local startNode = nodes[startId]
-		local function newState(ids, objSet, score)
-			return { ids = ids, set = objSet, score = score }
+		local function newState(ids, objSet, score, dps, ehp)
+			return { ids = ids, set = objSet, score = score, dps = dps, ehp = ehp }
 		end
 
 		local function cloneIdSet(t) local c = {} for k in pairs(t) do c[k] = true end return c end
+
+		-- selectBeam: choose the next beam from the SORTED-by-score candidate list. Two modes:
+		--   plain (SPIKE_PARETO=0): top-`beamWidth` by score — the original behaviour.
+		--   pareto (default):       top-`beamWidth` by score, AUGMENTED with Pareto-non-dominated
+		--     states (high on one axis even if lower-scoring), capped so the beam never exceeds
+		--     beamWidth + paretoExtra. Keeping diverse (dps,ehp) trade-offs alive lets the beam
+		--     stay NARROW without dropping the damage-seeking branch that a pure-score top-N culls
+		--     (the §3.5 Pareto point) — narrower beam ⇒ fewer expansions ⇒ fewer perform calls.
+		-- Also dedups by node-set signature: two states with the same set are identical, so we
+		-- never waste a beam slot on a duplicate (states with the same ids always tie on score).
+		local usePareto = os.getenv("SPIKE_PARETO") ~= "0"
+		local paretoExtra = tonumber(os.getenv("SPIKE_PARETO_EXTRA")) or math.max(4, math.floor(beamWidth / 2))
+		local function selectBeam(sorted)
+			local out, seenSig, n = {}, {}, 0
+			-- (1) top-beamWidth by score (sorted is already score-desc), deduped by signature
+			for _, st in ipairs(sorted) do
+				if n >= beamWidth then break end
+				local sig = sigOf(st.set)
+				if not seenSig[sig] then seenSig[sig] = true; out[#out+1] = st; n = n + 1 end
+			end
+			if not usePareto then return out end
+			-- (2) augment with Pareto-non-dominated states not already chosen. A state is kept if
+			-- no ALREADY-CHOSEN state dominates it on both axes (dps AND ehp). This pulls in the
+			-- extreme-trade-off branches a scalar top-N would discard. Capped at paretoExtra.
+			local added = 0
+			for _, st in ipairs(sorted) do
+				if added >= paretoExtra then break end
+				local sig = sigOf(st.set)
+				if not seenSig[sig] then
+					local dominated = false
+					for _, k in ipairs(out) do
+						if k.dps >= st.dps and k.ehp >= st.ehp and (k.dps > st.dps or k.ehp > st.ehp) then
+							dominated = true; break
+						end
+					end
+					if not dominated then
+						seenSig[sig] = true; out[#out+1] = st; added = added + 1
+					end
+				end
+			end
+			return out
+		end
 
 		-- BUDGET-DRIVEN: targetPoints is the point budget, NOT an iteration count. Moves spend
 		-- a variable number of points (1 for a single node, up to maxJump for a path-jump), so
@@ -295,8 +339,9 @@ describe("CleanSlate: beam reallocation", function()
 			for id in pairs(idSet) do if id ~= startId then n = n + 1 end end
 			return n
 		end
-		print(string.format("Beam width = %d, target points = %d (P=%d%s)", beamWidth, targetPoints,
-			P, maxDepthCap > 0 and (", capped at " .. maxDepthCap) or ""))
+		print(string.format("Beam width = %d, target points = %d (P=%d%s)  pareto=%s%s",
+			beamWidth, targetPoints, P, maxDepthCap > 0 and (", capped at " .. maxDepthCap) or "",
+			usePareto and ("on(+" .. paretoExtra .. ")") or "off", useMemo and "  memo=on" or ""))
 
 		-- runBeam: full beam search from the bare class start, honoring the current excludeSet.
 		-- Returns the final beam (sorted, best first) and the call count for this run.
@@ -304,11 +349,11 @@ describe("CleanSlate: beam reallocation", function()
 		local startCalls = calls
 		local initIds = { [startId] = true }
 		local initSet = { [startNode] = true }
-		local beam = { newState(initIds, initSet, 0) }
+		local beam = { newState(initIds, initSet, 0, 0, 0) }
 		-- Score of the empty (start-only) tree as the true baseline-from-scratch:
 		do
-			local s = scoreSet(initSet)
-			beam[1].score = s
+			local s, d, e = scoreSet(initSet)
+			beam[1].score, beam[1].dps, beam[1].ehp = s, d, e
 		end
 
 		-- Weighted shortest path (Dijkstra) from a candidate id-set. Returns, for each reachable
@@ -416,8 +461,8 @@ describe("CleanSlate: beam reallocation", function()
 							newSet[nodes[addId]] = true
 							newIds[addId] = true
 						end
-						local sc = scoreSet(newSet)
-						nextStates[#nextStates + 1] = newState(newIds, newSet, sc)
+						local sc, scDps, scEhp = scoreSet(newSet)
+						nextStates[#nextStates + 1] = newState(newIds, newSet, sc, scDps, scEhp)
 					end
 				end
 			end
@@ -426,8 +471,7 @@ describe("CleanSlate: beam reallocation", function()
 				break
 			end
 			table.sort(nextStates, function(a, b) return a.score > b.score end)
-			beam = {}
-			for i = 1, math.min(beamWidth, #nextStates) do beam[i] = nextStates[i] end
+			beam = selectBeam(nextStates)
 			local bp = pointsIn(beam[1].ids)
 			if step % 3 == 0 or bp >= targetPoints then
 				print(string.format("  step %2d: best score=%.1f (pts=%d/%d)  (%d calls, %.1fs)",

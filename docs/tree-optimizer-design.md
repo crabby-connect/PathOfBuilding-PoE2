@@ -262,6 +262,18 @@ The optimizer does a **clean-slate reallocation**, not "what to add next":
 > pruning, fewer rounds) are the next work. Spike flags added: `SPIKE_ACCEL`, `SPIKE_MEMO`,
 > `SPIKE_BENCH_N`.
 
+> **PARETO-AUGMENTED BEAM — IMPLEMENTED + VALIDATED (2026-06-04, `SPIKE_PARETO`, default on).**
+> Second call-count lever. The beam was pure top-N by scalar score, which clusters all N slots in
+> one corner of (DPS, EHP) and culls the damage-seeking branch (the §3.5 problem). `selectBeam`
+> now keeps top-`beamWidth` by score **plus** up to `SPIKE_PARETO_EXTRA` Pareto-non-dominated
+> states (high on one axis even if lower-scoring), and dedups states by node-set signature. Keeping
+> the diverse trade-offs alive lets the beam run **narrower** without losing the optimum — fewer
+> states expanded ⇒ fewer `perform` calls. **Measured (depth 20, mymonk):** plain beam=12 →
+> score 139.5 / **1963 distinct evals**; Pareto beam=6 (+4) → **score 139.5 (identical) / 1534
+> evals (−22 %)**. Same optimum at half the base width. Quality-preserving and stacks on accel+memo;
+> all sanity asserts still pass (clean-slate re-score = 956.6/2323.7). Flags: `SPIKE_PARETO` (0=off),
+> `SPIKE_PARETO_EXTRA` (default max(4, beamWidth/2)).
+
 **In scope (v1):**
 - Objective: `score = wDPS * FullDPS + wEHP * TotalEHP` with user-set weights, plus a
   Pareto frontier so hybrid solutions aren't discarded.
