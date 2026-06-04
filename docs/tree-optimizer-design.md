@@ -274,6 +274,28 @@ The optimizer does a **clean-slate reallocation**, not "what to add next":
 > all sanity asserts still pass (clean-slate re-score = 956.6/2323.7). Flags: `SPIKE_PARETO` (0=off),
 > `SPIKE_PARETO_EXTRA` (default max(4, beamWidth/2)).
 
+> **JUMP-CANDIDATE CAP — IMPLEMENTED, but a SPEED/QUALITY KNOB, not a free win (2026-06-04,
+> `SPIKE_MAXJUMPCAND`, OFF by default).** Per beam state, every reachable notable/keystone within
+> `maxJump` becomes one full `scoreSet` — the **dominant** branching cost (uncapped depth-25 run:
+> 5479 distinct evals). The cap keeps the **K nearest notables by point distance** (+ **all
+> keystones**, exempt) and drops the rest. The eval saving is large and real, but on a build whose
+> damage sits FAR from the class start it **costs score**:
+> | config (depth 25, beam 8) | score | dps | distinct evals |
+> | --- | --- | --- | --- |
+> | uncapped | **151.1** | 361.9 | 5479 |
+> | cap=8 (keystone-exempt) | 145.4 | 263.3 | 2415 (**−56 %**) |
+> | cap=20 | 147.6 | 321.0 | 2687 (−51 %) |
+>
+> So the cap buys ~45–56 % fewer evals for a ~4 % score loss on `mymonk`. **Root cause: there is no
+> calc-free heuristic that distinguishes a distant DAMAGE notable from distant junk** — exactly the
+> §3.3 finding (modlist-sum had 10 % recall). Distance is the only safe free signal, and `mymonk`'s
+> damage (Glaciation/Snowpiercer clusters) is genuinely far, so nearest-K starves it. The keystone
+> exemption helps only slightly because this build's distant value is in *notables*, not keystones.
+> **Verdict:** keep it as an opt-in knob for users who want speed over the last few % of optimum; do
+> NOT make it a default — the honest default stays uncapped. If a cheap quality signal ever exists
+> (e.g. a one-time PowerBuilder pass to seed per-node power, then cap by power-per-point instead of
+> distance), revisit — that's the only way to cap without the quality hit.
+
 **In scope (v1):**
 - Objective: `score = wDPS * FullDPS + wEHP * TotalEHP` with user-set weights, plus a
   Pareto frontier so hybrid solutions aren't discarded.

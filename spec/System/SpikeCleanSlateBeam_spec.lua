@@ -339,9 +339,11 @@ describe("CleanSlate: beam reallocation", function()
 			for id in pairs(idSet) do if id ~= startId then n = n + 1 end end
 			return n
 		end
-		print(string.format("Beam width = %d, target points = %d (P=%d%s)  pareto=%s%s",
+		local jumpCandCap = tonumber(os.getenv("SPIKE_MAXJUMPCAND")) or 0
+		print(string.format("Beam width = %d, target points = %d (P=%d%s)  pareto=%s%s  jumpCand=%s",
 			beamWidth, targetPoints, P, maxDepthCap > 0 and (", capped at " .. maxDepthCap) or "",
-			usePareto and ("on(+" .. paretoExtra .. ")") or "off", useMemo and "  memo=on" or ""))
+			usePareto and ("on(+" .. paretoExtra .. ")") or "off", useMemo and "  memo=on" or "",
+			jumpCandCap > 0 and tostring(jumpCandCap) or "uncapped"))
 
 		-- runBeam: full beam search from the bare class start, honoring the current excludeSet.
 		-- Returns the final beam (sorted, best first) and the call count for this run.
@@ -411,6 +413,9 @@ describe("CleanSlate: beam reallocation", function()
 		-- Path-jumps are deduped by target modKey; we also cap jump length so we don't blow
 		-- the budget in one move.
 		local maxJump = tonumber(os.getenv("SPIKE_MAXJUMP")) or 8
+		-- 0 = uncapped (keep every reachable jump target). >0 = keep only the K nearest per state.
+		local maxJumpCand = tonumber(os.getenv("SPIKE_MAXJUMPCAND")) or 0
+		local jumpCut = 0  -- count of jump candidates dropped by the cap this run (reporting)
 		local t0 = os.clock()
 		local step = 0
 		local maxSteps = targetPoints + 5 -- safety: at minimum 1 pt/step, so this always terminates
@@ -440,15 +445,44 @@ describe("CleanSlate: beam reallocation", function()
 						end
 					end
 					-- (b) notable/keystone path-jumps (target must be targetable; the PATH may pass
-					-- through excluded nodes via the detour-weighted pdist, but only as last resort)
+					-- through excluded nodes via the detour-weighted pdist, but only as last resort).
+					-- JUMP-CANDIDATE CAP (SPIKE_MAXJUMPCAND): every reachable notable/keystone within
+					-- maxJump otherwise becomes one full scoreSet — the dominant branching cost. When
+					-- a cap is set, keep the K NEAREST NOTABLES by point distance and drop the rest,
+					-- BUT always keep ALL reachable KEYSTONES regardless of distance. Distance is the
+					-- cheap, calc-free proxy (a modlist-sum proxy was rejected — design doc 3.3, 10%
+					-- recall); nearer notables are point-efficient and farther ones reappear as cheaper
+					-- jumps later. The keystone exemption is the fix for the doc's "long travel to a
+					-- great keystone" caveat: keystones are rare and build-defining, so a pure nearest-K
+					-- starves them (measured: nearest-8 lost mymonk's distant damage cluster, dps 362→250).
+					local jumpKeys, jumpNotes = {}, {}
 					for tid, d in pairs(dist) do
 						local tnode = nodes[tid]
-						if not st.ids[tid] and d >= 2 and d <= math.min(maxJump, pointsLeft)
-							and (tnode.type == "Notable" or tnode.type == "Keystone") and targetable(tnode) then
-							local k = "j:" .. (tnode.modKey ~= "" and tnode.modKey or tid)
+						if not st.ids[tid] and d >= 2 and d <= math.min(maxJump, pointsLeft) and targetable(tnode) then
+							if tnode.type == "Keystone" then
+								jumpKeys[#jumpKeys+1] = { tid = tid, d = d }
+							elseif tnode.type == "Notable" then
+								jumpNotes[#jumpNotes+1] = { tid = tid, d = d }
+							end
+						end
+					end
+					if maxJumpCand > 0 and #jumpNotes > maxJumpCand then
+						-- nearest-K notables by distance (tie-break by id for determinism)
+						table.sort(jumpNotes, function(a, b)
+							if a.d ~= b.d then return a.d < b.d end
+							return a.tid < b.tid
+						end)
+						jumpCut = jumpCut + (#jumpNotes - maxJumpCand)
+						for i = #jumpNotes, maxJumpCand + 1, -1 do jumpNotes[i] = nil end
+					end
+					-- keystones always kept; notables capped to nearest-K
+					for _, src in ipairs({ jumpKeys, jumpNotes }) do
+						for _, jc in ipairs(src) do
+							local tnode = nodes[jc.tid]
+							local k = "j:" .. (tnode.modKey ~= "" and tnode.modKey or jc.tid)
 							if not seenKey[k] then
 								seenKey[k] = true
-								moves[#moves+1] = { ids = pathTo(tid), key = k }
+								moves[#moves+1] = { ids = pathTo(jc.tid), key = k }
 							end
 						end
 					end
@@ -477,6 +511,9 @@ describe("CleanSlate: beam reallocation", function()
 				print(string.format("  step %2d: best score=%.1f (pts=%d/%d)  (%d calls, %.1fs)",
 					step, beam[1].score, bp, targetPoints, calls, os.clock() - t0))
 			end
+		end
+		if maxJumpCand > 0 and jumpCut > 0 then
+			print(string.format("  jump-cap: kept nearest %d/state, dropped %d distant jump candidates", maxJumpCand, jumpCut))
 		end
 		return beam, calls - startCalls, os.clock() - t0
 		end  -- runBeam
