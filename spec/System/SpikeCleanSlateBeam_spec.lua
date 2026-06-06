@@ -638,6 +638,14 @@ describe("CleanSlate: beam reallocation", function()
 		-- SAFETY: any id in `mandatory` (a detected build enabler) is stripped from the
 		-- exclusion list before running, so no run can ever disable a load-bearing keystone.
 		local function runRun(label, excludeIds)
+			-- OOM FIX: the memo persisted for the whole spike and grew unbounded (one string
+			-- key + result table per distinct node-set, ~134k by round 2), eventually hitting
+			-- LuaJIT's ~2GB GC ceiling and crashing mid-diet ("not enough memory"). The 40% hit
+			-- rate is dominated by WITHIN-round reuse (overlapping beam frontiers); cross-round
+			-- hits were the smaller share. So we reset the cache per round and force a GC sweep
+			-- to actually hand the memory back, bounding peak usage to a single round's sets.
+			if useMemo then scoreMemo = {} end
+			collectgarbage("collect")
 			local effective, skipped = {}, {}
 			for _, id in ipairs(excludeIds or {}) do
 				if mandatory[id] then skipped[#skipped+1] = id else effective[#effective+1] = id end
