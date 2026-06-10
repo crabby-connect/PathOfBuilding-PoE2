@@ -94,6 +94,13 @@ describe("TestSkills", function()
 		assert.True(build.calcsTab.mainOutput.SpiritReservedPercent > oneCurseReservation)
 	end)
 
+	it("applies active skill reservation multiplier to linked buff spirit reservation", function()
+		build.skillsTab:PasteSocketGroup("Purity of Fire 20/0  1\nVitality II 1/0  1\n")
+		runCallback("OnFrame")
+
+		assert.are.equals(0, build.calcsTab.mainOutput.SpiritReserved)
+	end)
+
 	it("Keeps Virtuous armour scaling during Full DPS loop", function()
 		build.itemsTab:CreateDisplayItemFromRaw("New Item\nRazor Quarterstaff\nQuality: 0")
 		build.itemsTab:AddDisplayItem()
@@ -111,7 +118,7 @@ describe("TestSkills", function()
 
 		local normalArmour = env.player.output.Armour
 		local normalDPS = env.player.output.TotalDPS
-		assert.are.equals(1050, normalArmour)
+		assert.are.equals(1200, normalArmour)
 		assert.is_true(normalDPS > 0)
 
 		env = calcs.initEnv(build, "CALCULATOR", {}, {
@@ -1046,5 +1053,57 @@ describe("TestSkills", function()
 		assert.True(fistOfWarOneMaxDmgEffect < build.calcsTab.calcsOutput.MaxAncestralEmpowermentCombinedDamageEffect)
 		local expectedAverageEffect = 1 + (build.calcsTab.calcsOutput.MaxAncestralEmpowermentCombinedDamageEffect - 1) * build.calcsTab.calcsOutput.AncestralEmpowermentCombinedUptimeRatio / 100
 		assert.are.equals(round(expectedAverageEffect, 4), round(build.calcsTab.calcsOutput.AvgAncestralEmpowermentCombinedDamageEffect, 4))
+	end)
+
+	it("calculates effects of parry debuff correctly", function()
+		build.itemsTab:CreateDisplayItemFromRaw([[
+			Generic EV Shield
+			Desert Buckler
+			Evasion: 230
+			Quality: 20
+			LevelReq: 80
+		]])
+		build.itemsTab:AddDisplayItem()
+		runCallback("OnFrame")
+		build.skillsTab:PasteSocketGroup("Parry 20/0  1")
+		runCallback("OnFrame")
+		build.configTab:BuildModList()
+		runCallback("OnFrame")
+		build.calcsTab:BuildOutput()
+		runCallback("OnFrame")
+
+		-- Test general debuff
+		local preParryDmg = build.calcsTab.mainOutput.AverageDamage
+		build.configTab.configSets[1].input.parryActive = true
+		build.configTab:BuildModList()
+		build.calcsTab:BuildOutput()
+		runCallback("OnFrame")
+		local postParryDmg = build.calcsTab.mainOutput.AverageDamage
+		assert.True(postParryDmg > preParryDmg, "Damage should be higher with Parry active")
+		
+		-- Test Magnitude
+		build.configTab.input.customMods = "50% increased parried debuff magnitude"
+		build.configTab:BuildModList()
+		runCallback("OnFrame")
+		build.calcsTab:BuildOutput()
+		runCallback("OnFrame")
+		local incMagnitudeDmg = build.calcsTab.mainOutput.AverageDamage
+		assert.True(incMagnitudeDmg > postParryDmg, "Damage should be higher with increased parried debuff magnitude")
+
+		-- Test effect on spells
+		build.skillsTab:PasteSocketGroup("Bone Cage 20/0  1")
+		runCallback("OnFrame")
+		selectActiveSkillById(build.skillsTab.socketGroupList[#build.skillsTab.socketGroupList], "BoneCagePlayer")
+		runCallback("OnFrame")
+		build.calcsTab:BuildOutput()
+		runCallback("OnFrame")
+		local withParrySpellDmg = build.calcsTab.mainOutput.AverageDamage
+		build.configTab.configSets[1].input.parryActive = false
+		build.configTab:BuildModList()
+		runCallback("OnFrame")
+		build.calcsTab:BuildOutput()
+		runCallback("OnFrame")
+		local noParrySpellDmg = build.calcsTab.mainOutput.AverageDamage
+		assert.equals(withParrySpellDmg, noParrySpellDmg, "Parry should not affect spell damage")
 	end)
 end)

@@ -43,6 +43,59 @@ describe("ImportTab", function()
 		assert.are.equals(1, #importTab.controls.charSelect.list)
 		assert.True(importTab.controls.charSelect.list[1].detail:match("Future Ascendancy") ~= nil)
 	end)
+
+	it("imports Split Personality alternate class start from character JSON", function()
+		local spec = build.spec
+		local socketNode = spec.nodes[60735]
+		local rangerStartPassive = spec.nodes[56651]
+		assert.is_not_nil(socketNode)
+		assert.is_not_nil(rangerStartPassive)
+
+		local hashes = { socketNode.id, rangerStartPassive.id }
+		for _, pathNode in ipairs(socketNode.path or { }) do
+			table.insert(hashes, pathNode.id)
+		end
+
+		local rangerStart = spec.nodes[spec.tree.classes[spec.tree.classNameMap.Ranger].startNodeId]
+		local importPayload = {
+			name = "Split Import Test",
+			class = "Witch2",
+			league = "Test",
+			level = 90,
+			jewels = {
+				{
+					id = "split-personality-test",
+					frameType = 3,
+					name = "Split Personality",
+					typeLine = "Ruby",
+					inventoryId = "PassiveJewels",
+					x = 4,
+					ilvl = 84,
+					properties = { },
+					explicitMods = {
+						"Can Allocate Passive Skills from the Ranger's starting point",
+					},
+				},
+			},
+			passives = {
+				hashes = hashes,
+				specialisations = { },
+				skill_overrides = { },
+				jewel_data = { },
+				quest_stats = { },
+			},
+		}
+
+		build.importTab:ImportPassiveTreeAndJewels(importPayload)
+
+		local importedSpec = build.spec
+		local importedJewel = build.itemsTab.items[importedSpec.jewels[socketNode.id]]
+		assert.are.equals("Ranger", importedJewel.jewelData.alternateClassStart)
+
+		assert.are.equals(0, importedSpec.nodes[rangerStart.id].pathDist)
+		assert.True(importedSpec.nodes[rangerStartPassive.id].alloc)
+		assert.True(importedSpec.nodes[rangerStartPassive.id].connectedToStart)
+	end)
 end)
 
 describe("ImportTab quest reward import", function()
@@ -158,5 +211,30 @@ describe("ImportTab quest reward import", function()
 		local input = importStats({ "45% increased Global [Armour], [Evasion] and [EnergyShield|Energy Shield]" })
 		assert.are.equals(tribal.Options[1], input[tribalVar])
 		assert.are.equals(seven.Options[3], input[sevenVar])
+	end)
+
+	it("imports Boss's Faces Broken without affecting quest reward matching", function()
+		local sevenVar, seven = findQuest("Seven Pillars")
+		local input = importStats({
+			"+20 to maximum Life",
+			"5% increased maximum Life",
+			"5% increased maximum Mana",
+			"+100 to [Spirit|Spirit]",
+			"30% increased [Charm] Effect Duration",
+			"+5% to [Resistances|Fire Resistance]",
+			"+15% to [Resistances|Cold Resistance]",
+			"+15% to [Resistances|Lightning Resistance]",
+			"30% increased Life Recovery from [Flask|Flasks]",
+			"45% increased Global [Armour], [Evasion] and [EnergyShield|Energy Shield]",
+			"25% increased [StunThreshold|Stun Threshold]",
+			"+1 [Charm] Slot",
+			"58 [BrokenFace|Broken Boss Faces]",
+		})
+
+		assert.is_nil(input.configBossFaceBroken)
+		assert.are.equals(58, build.configTab.placeholder.configBossFaceBroken)
+		assert.are.equals(seven.Options[3], input[sevenVar])
+		runCallback("OnFrame")
+		assert.is_false(build.configTab.varControls.configBossFaceBroken.shown())
 	end)
 end)

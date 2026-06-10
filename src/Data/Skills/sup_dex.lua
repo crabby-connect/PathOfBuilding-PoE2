@@ -1445,11 +1445,6 @@ skills["SupportCooldownRecoveryPlayer"] = {
 			label = "Cooldown Recovery I",
 			incrementalEffectiveness = 0.054999999701977,
 			statDescriptionScope = "gem_stat_descriptions",
-			statMap = {
-				["support_cooldown_reduction_cooldown_recovery_+%"] = {
-					mod("CooldownRecovery", "INC", nil),
-				},
-			},
 			baseFlags = {
 			},
 			constantStats = {
@@ -1481,11 +1476,6 @@ skills["SupportCooldownRecoveryPlayerTwo"] = {
 			label = "Cooldown Recovery II",
 			incrementalEffectiveness = 0.054999999701977,
 			statDescriptionScope = "gem_stat_descriptions",
-			statMap = {
-				["support_cooldown_reduction_cooldown_recovery_+%"] = {
-					mod("CooldownRecovery", "INC", nil),
-				},
-			},
 			baseFlags = {
 			},
 			constantStats = {
@@ -2640,10 +2630,10 @@ skills["SupportChargeInhibitionPlayer"] = {
 }
 skills["SupportInnervatePlayer"] = {
 	name = "Innervate",
-	description = "Supports Attacks you use yourself. Killing a Shocked enemy with supported skills imbues all of your Attacks with Lightning damage for a short time.",
+	description = "Supports damaging skills you use yourself. Killing a Shocked enemy with supported skills imbues your damage with Lightning damage for a short time.",
 	color = 2,
 	support = true,
-	requireSkillTypes = { SkillType.Attack, SkillType.CrossbowAmmoSkill, },
+	requireSkillTypes = { SkillType.Attack, SkillType.CrossbowAmmoSkill, SkillType.Damage, },
 	addSkillTypes = { SkillType.Duration, },
 	excludeSkillTypes = { SkillType.UsedByProxy, SkillType.Triggered, SkillType.Persistent, },
 	gemFamily = { "Innervate",},
@@ -2777,10 +2767,10 @@ skills["SupportLifeOnCullPlayer"] = {
 }
 skills["SupportAddedLightningDamagePlayer"] = {
 	name = "Lightning Attunement",
-	description = "Supports Attacks, causing them to Gain Lightning Damage but deal less Cold and Fire Damage.",
+	description = "Supports any skill that deals damage, causing them to Gain Lightning Damage but deal less Cold and Fire Damage.",
 	color = 2,
 	support = true,
-	requireSkillTypes = { SkillType.Attack, SkillType.CrossbowAmmoSkill, },
+	requireSkillTypes = { SkillType.Attack, SkillType.CrossbowAmmoSkill, SkillType.Damage, },
 	addSkillTypes = { },
 	excludeSkillTypes = { },
 	gemFamily = { "LightningAttunement",},
@@ -2802,7 +2792,7 @@ skills["SupportAddedLightningDamagePlayer"] = {
 			baseFlags = {
 			},
 			constantStats = {
-				{ "non_skill_base_all_damage_%_to_gain_as_lightning_with_attacks", 25 },
+				{ "non_skill_base_all_damage_%_to_gain_as_lightning", 25 },
 				{ "support_cold_and_fire_damage_+%_final", -50 },
 			},
 			stats = {
@@ -5068,7 +5058,7 @@ skills["SupportSecondWindPlayer"] = {
 	support = true,
 	requireSkillTypes = { SkillType.Cooldown, SkillType.AffectedByCooldownRate, },
 	addSkillTypes = { },
-	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, SkillType.UsedByProxy, },
+	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, },
 	gemFamily = { "SecondWind",},
 	ignoreMinionTypes = true,
 	levels = {
@@ -5100,7 +5090,7 @@ skills["SupportSecondWindPlayerTwo"] = {
 	support = true,
 	requireSkillTypes = { SkillType.Cooldown, SkillType.AffectedByCooldownRate, },
 	addSkillTypes = { },
-	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, SkillType.UsedByProxy, },
+	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, },
 	gemFamily = { "SecondWind",},
 	ignoreMinionTypes = true,
 	levels = {
@@ -5132,7 +5122,7 @@ skills["SupportSecondWindPlayerThree"] = {
 	support = true,
 	requireSkillTypes = { SkillType.Cooldown, SkillType.AffectedByCooldownRate, },
 	addSkillTypes = { },
-	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, SkillType.UsedByProxy, },
+	excludeSkillTypes = { SkillType.Triggered, SkillType.Instant, SkillType.Meta, },
 	gemFamily = { "SecondWind",},
 	ignoreMinionTypes = true,
 	levels = {
