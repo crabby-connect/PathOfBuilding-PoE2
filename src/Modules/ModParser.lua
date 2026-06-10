@@ -244,6 +244,7 @@ local modNameList = {
 	["evasion rating and armour"] = "ArmourAndEvasion",
 	["armour and energy shield"] = "ArmourAndEnergyShield",
 	["evasion rating and energy shield"] = "EvasionAndEnergyShield",
+	["global evasion rating and energy shield"] = { "Evasion", "EnergyShield" },
 	["evasion and energy shield"] = "EvasionAndEnergyShield",
 	["armour, evasion and energy shield"] = "Defences",
 	["defences"] = "Defences",
@@ -503,6 +504,9 @@ local modNameList = {
 	["maximum fortification"] = "MaximumFortification",
 	["fortification"] = "MinimumFortification",
 	["maximum valour"] = "MaximumValour",
+	["parried debuff magnitude"] = "ParryDebuffMagnitude",
+	["parried debuff duration"] = "ParryDebuffDuration",
+	["parry range"] = { "ParryRangeNonProj", "ParryRangeProj" },
 	-- Charges
 	["maximum power charge"] = "PowerChargesMax",
 	["maximum power charges"] = "PowerChargesMax",
@@ -662,7 +666,6 @@ local modNameList = {
 	["cooldown recovery rate"] = "CooldownRecovery",
 	["cooldown use"] = "AdditionalCooldownUses",
 	["cooldown uses"] = "AdditionalCooldownUses",
-	["range"] = "WeaponRange",
 	["weapon range"] = "WeaponRange",
 	["metres to weapon range"] = "WeaponRangeMetre",
 	["metre to weapon range"] = "WeaponRangeMetre",
@@ -1453,6 +1456,7 @@ local modTagList = {
 	["per mana burn on you"] = { tag = { type = "Multiplier", var = "ManaBurnStacks" } },
 	["per mana burn, up to a maximum of (%d+)%%"] = function(num) return { tag = { type = "Multiplier", var = "ManaBurnStacks", limit = tonumber(num), limitTotal = true } } end,
 	["per level"] = { tag = { type = "Multiplier", var = "Level" } },
+	["per player level"] = { tag = { type = "Multiplier", var = "Level" } },
 	["per (%d+) player levels"] = function(num) return { tag = { type = "Multiplier", var = "Level", div = num } } end,
 	["per defiance"] = { tag = { type = "Multiplier", var = "Defiance" } },
 	["per (%d+)%% (%a+) effect on enemy"] = function(num, _, effectName) return { tag = { type = "Multiplier", var = firstToUpper(effectName) .. "Effect", div = num, actor = "enemy" } } end,
@@ -2724,7 +2728,8 @@ local specialModList = {
 	["evasion rating from equipped body armour is halved"] = { mod("Evasion", "MORE", -50, { type = "SlotName", slotName = "Body Armour" }) },
 	-- Ascendant
 	["grants (%d+) passive skill points?"] = function(num) return { mod("ExtraPoints", "BASE", num) } end,
-	["can allocate passives from the %a+'s starting point"] = { },
+	["can allocate passives from the (%a+)'s starting point"] = function(_, className) return { mod("AlternateClassStart", "LIST", firstToUpper(className)) } end,
+	["can allocate passive skills from the (%a+)'s starting point"] = function(_, className) return { mod("AlternateClassStart", "LIST", firstToUpper(className)) } end,
 	["projectiles gain damage as they travel farther, dealing up to (%d+)%% increased damage with hits to targets"] = function(num) return { mod("Damage", "INC", num, nil, bor(ModFlag.Hit, ModFlag.Projectile), { type = "DistanceRamp", ramp = { {35,0},{70,1} } }) } end,
 	["(%d+)%% chance to gain elusive on kill"] = {
 		flag("Condition:CanBeElusive"),
@@ -3360,7 +3365,7 @@ local specialModList = {
 	["all flames of chayula that you manifest are red"] = { flag("BreachFlameOnlyRed") },
 	["all flames of chayula that you manifest are blue"] = { flag("BreachFlameOnlyBlue") },
 	["all flames of chayula that you manifest are purple"] = { flag("BreachFlameOnlyPurple") },
-	["mana leech recovers based on other damage types damage as well as physical damage"] = { -- legacy wording 
+	["mana leech recovers based on other damage types damage as well as physical damage"] = { -- legacy wording
 		flag("ManaLeechBasedOnElementalDamage"),
 		flag("ManaLeechBasedOnChaosDamage"),
 	},
@@ -3396,6 +3401,9 @@ local specialModList = {
 	},
 	-- Item local modifiers
 	["has no sockets"] = { flag("NoSockets") },
+	["has ([%+%-]%d+) to evasion rating per player level"] = function(num) return { mod("EvasionPerLevel", "BASE", num) } end,
+	["has ([%+%-]%d+) to maximum energy shield per player level"] = function(num) return { mod("EnergyShieldPerLevel", "BASE", num) } end,
+	["has ([%+%-]%d+) to maximum runic ward per player level"] = function(num) return { mod("WardPerLevel", "BASE", num) } end,
 	["reflects your other ring"] = {
 		-- Display only. For Kalandra's Touch.
 	},
@@ -3728,6 +3736,8 @@ local specialModList = {
 	["your critical hit chance is lucky while focus?sed"] = { flag("CritChanceLucky", { type = "Condition", var = "Focused" }) },
 	["your critical hits do not deal extra damage"] = { flag("NoCritMultiplier") },
 	["critical hits do not deal extra damage"] = { flag("NoCritMultiplier") },
+	["you have no critical damage bonus"] = { flag("NoCritMultiplier") },
+	["hits with this weapon have no critical damage bonus"] = { flag("NoCritMultiplier", { type = "Condition", var = "{Hand}Attack" }) },
 	["minion critical hits do not deal extra damage"] = { mod("MinionModifier", "LIST", { mod = flag("NoCritMultiplier") }) },
 	["lightning damage with non%-critical hits is lucky"] = { flag("LightningNoCritLucky") },
 	["your damage with critical hits is lucky"] = { flag("CritLucky") },
@@ -3912,6 +3922,7 @@ local specialModList = {
 	} end,
 	["enemies ignited by you during f?l?a?s?k? ?effect take (%d+)%% increased damage"] = function(num) return { mod("EnemyModifier", "LIST", { mod = mod("DamageTaken", "INC", num) }, { type = "ActorCondition", actor = "enemy", var = "Ignited" }) } end,
 	["enemies ignited by you take chaos damage instead of fire damage from ignite"] = { flag("IgniteToChaos") },
+	["ignite you inflict deals chaos damage instead of fire damage"] = { flag("IgniteToChaos") },
 	["enemies chilled by your hits are shocked"] = {
 		mod("ShockBase", "BASE", data.nonDamagingAilment["Shock"].default, { type = "ActorCondition", actor = "enemy", var = "ChilledByYourHits" }),
 		mod("EnemyModifier", "LIST", { mod = flag("Condition:Shocked", { type = "Condition", var = "ChilledByYourHits" }) })
@@ -5485,6 +5496,7 @@ local specialModList = {
 	["magic utility flasks applied to you have (%d+)%% increased effect"] = function(num) return { mod("MagicUtilityFlaskEffect", "INC", num, { type = "ActorCondition", actor = "player"}) } end,
 	["flasks applied to you have (%d+)%% reduced effect"] = function(num) return { mod("FlaskEffect", "INC", -num, { type = "ActorCondition", actor = "player"}) } end,
 	["remnants have (%d+)%% increased effect"] = function(num) return { mod("RemnantEffect", "INC", num) } end,
+	["remnants you create have (%d+)%% increased effect"] = function(num) return { mod("RemnantEffect", "INC", num) } end,
 	["(%d+)%% increased charm cooldown recovery rate"] = function(num) return { mod("CharmCooldownRecovery", "INC", num) } end,
 	["adds (%d+) passive skills"] = function(num) return { mod("JewelData", "LIST", { key = "clusterJewelNodeCount", value = num }) } end,
 	["1 added passive skill is a jewel socket"] = { mod("JewelData", "LIST", { key = "clusterJewelSocketCount", value = 1 }) },
@@ -5866,11 +5878,28 @@ local specialModList = {
 		flag("Condition:OnConsecratedGround", { type = "Condition", var = "StrHighestAttribute" }, { type = "Condition", var = "Stationary" }),
 	},
 	["you count as dual wielding while you are unencumbered"] = { flag("Condition:DualWielding", { type = "Condition", var = "Unencumbered" }) },
-	["can attack as though using a quarterstaff while both of your hand slots are empty unarmed attacks that would use your quarterstaff's damage gain: physical damage based on their skill level (%d+)%% more attack speed per (%d+) item evasion rating on equipped armour items %+(%d+%.?%d*)%% to critical hit chance per (%d+) item energy shield on equipped armour items"] = function(asNum, _, evNum, critNum, esNum) return
-	{	-- New Hollow Palm Technique
+	["can attack as though using a quarterstaff while both of your hand slots are empty unarmed attacks that would use your quarterstaff's damage gain: physical damage based on their skill level (%d+)%% more attack speed per (%d+) item evasion rating on equipped armour items %+(%d+%.?%d*)%% to critical hit chance per (%d+) item energy shield on equipped armour items"] = function(asNum, _, evNum, critNum, esNum) return {
 		mod("Speed", "MORE", tonumber(asNum), nil, ModFlag.Attack, { type = "Condition", var = "HollowPalm" }, { type = "PerStat", stat = "EvasionOnAllArmourItems", div = tonumber(evNum) }),
-		mod("CritChance", "BASE", tonumber(critNum), nil, ModFlag.Attack, { type = "Condition", var = "HollowPalm" }, { type = "PerStat", stat = "EnergyShieldOnAllArmourItems", div = (esNum) }),
+		mod("CritChance", "BASE", tonumber(critNum), nil, ModFlag.Attack, { type = "Condition", var = "HollowPalm" }, { type = "PerStat", stat = "EnergyShieldOnAllArmourItems", div = tonumber(esNum) }),
 	} end,
+	["can attack as though using a quarterstaff while both of your hand slots are empty unarmed attacks that would use an equipped quarterstaff's damage have: base unarmed physical damage replaced with damage based on their skill level (%d+)%% more attack speed per (%d+) item evasion on equipped armour items %+(%d+%.?%d*)%% to critical hit chance per (%d+) item energy shield on equipped armour items"] = function(asNum, _, evNum, critNum, esNum) return {
+		mod("Speed", "MORE", tonumber(asNum), nil, ModFlag.Attack, { type = "Condition", var = "HollowPalm" }, { type = "PerStat", stat = "EvasionOnAllArmourItems", div = tonumber(evNum) }),
+		mod("CritChance", "BASE", tonumber(critNum), nil, ModFlag.Attack, { type = "Condition", var = "HollowPalm" }, { type = "PerStat", stat = "EnergyShieldOnAllArmourItems", div = tonumber(esNum) }),
+	} end,
+	-- Facebreaker (and its Fire variant): the gloves grant base weapon damage that empty-handed One Hand Mace attacks use.
+	-- The base damage is stored separately and copied onto the attack source when a compatible skill uses the item damage.
+	-- "Boss's Face Broken" is a stacking counter exposed through the Configuration tab (Multiplier:BossFaceBroken).
+	["has (%d+) to (%d+) (%a+) damage, %+(%d+) to %+(%d+) per boss's face broken"] = function(min, _, max, dmgType, perMin, perMax)
+		local dmg = dmgType:sub(1, 1):upper() .. dmgType:sub(2)
+		return {
+			mod("Facebreaker"..dmg.."Min", "BASE", tonumber(min)),
+			mod("Facebreaker"..dmg.."Max", "BASE", tonumber(max)),
+			mod("Facebreaker"..dmg.."Min", "BASE", tonumber(perMin), { type = "Multiplier", var = "BossFaceBroken" }),
+			mod("Facebreaker"..dmg.."Max", "BASE", tonumber(perMax), { type = "Multiplier", var = "BossFaceBroken" }),
+		}
+	end,
+	["can attack as though using a one handed mace while both of your hand slots are empty"] = { flag("CanAttackAsOneHandMaceUnarmed") },
+	["unarmed attacks that would use an equipped one hand mace's damage use this item's damage"] = { flag("UseFacebreakerItemDamage") },
 	["storm and plant spells: deal (%d+)%% more damage cost (%d+)%% less have (%d+)%% less duration"] = function(damageNum, _, costNum, durationNum) return { -- Wildsurge Incantation
 		mod("Damage", "MORE", damageNum, nil, 0, KeywordFlag.Spell, { type = "SkillType", skillTypeList = { SkillType.Storm, SkillType.Plant } } ),
 		mod("Cost", "MORE", -tonumber(costNum), nil, 0, KeywordFlag.Spell, { type = "SkillType", skillTypeList = { SkillType.Storm, SkillType.Plant } } ),
@@ -5928,6 +5957,9 @@ local specialModList = {
 	["attacks cost life instead of mana"] = { flag("CostLifeInsteadOfMana", nil, ModFlag.Attack) },
 
 	["skills gain a base life cost equal to (%d+)%% of base mana cost"] = function(num) return {
+		mod("BaseManaCostAsLifeCost", "BASE", num),
+	} end,
+	["skills gain (%d+)%% of mana cost as extra life cost"] = function(num) return {
 		mod("BaseManaCostAsLifeCost", "BASE", num),
 	} end,
 	["skills gain a base energy shield cost equal to (%d+)%% of base mana cost"] = function(num) return {

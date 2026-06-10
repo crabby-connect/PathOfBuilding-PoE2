@@ -587,7 +587,7 @@ return {
 	mod("CooldownRecovery", "MORE", nil),
 },
 ["support_cooldown_reduction_cooldown_recovery_+%"] = {
-	mod("CooldownRecovery", "MORE", nil),
+	mod("CooldownRecovery", "INC", nil),
 },
 ["additional_weapon_base_attack_time_ms"] = {
 	mod("Speed", "BASE", nil, ModFlag.Attack),
@@ -1088,6 +1088,15 @@ return {
 },
 ["lightning_damage_%_to_add_as_chaos"] = {
 	mod("LightningDamageGainAsChaos", "BASE", nil),
+},
+["non_skill_base_all_damage_%_to_gain_as_lightning"] = {
+	mod("DamageGainAsLightning", "BASE", nil),
+},
+["non_skill_base_all_damage_%_to_gain_as_cold"] = {
+	mod("DamageGainAsCold", "BASE", nil),
+},
+["non_skill_base_all_damage_%_to_gain_as_fire"] = {
+	mod("DamageGainAsFire", "BASE", nil),
 },
 ["non_skill_base_all_damage_%_to_gain_as_chaos"] = {
 	mod("DamageGainAsChaos", "BASE", nil),
@@ -1850,7 +1859,7 @@ return {
 },
 ["spell_skills_fire_2_additional_projectiles_final_chance_%"] = {
 	mod("TwoAdditionalProjectilesChance", "BASE", nil),
-},	
+},
 ["additional_beam_only_chains"] = {
 	mod("BeamChainCountMax", "BASE", nil),
 },
@@ -2503,6 +2512,13 @@ return {
 ["companions_are_gigantic"] = {
 	mod("MinionModifier", "LIST", { mod = flag("Gigantic") }),
 },
+["minion_damage_+%_final_per_different_elemental_ailment_on_target"] = {
+	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil, 0, 0, { type = "ActorCondition", actor = "enemy", var = "Electrocuted" }) }),
+	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil, 0, 0, { type = "ActorCondition", actor = "enemy", var = "Frozen" }) }),
+	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil, 0, 0, { type = "ActorCondition", actor = "enemy", var = "Chilled" }) }),
+	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil, 0, 0, { type = "ActorCondition", actor = "enemy", var = "Ignited" }) }),
+	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil, 0, 0, { type = "ActorCondition", actor = "enemy", var = "Shocked" }) }),
+},
 ["base_number_of_zombies_allowed"] = {
 	mod("ActiveZombieLimit", "BASE", nil),
 },
@@ -2550,6 +2566,12 @@ return {
 },
 ["maximum_corpse_beetles_allowed"] = {
 	mod("BeetleLimit", "BASE", nil),
+},
+["max_azmerian_swarms"] = {
+	mod("AzmerianSwarmLimit", "BASE", nil),
+},
+["base_number_of_wardbound_minions_allowed"] = {
+	mod("WardboundLimit", "BASE", nil),
 },
 ["active_skill_minion_damage_+%_final"] = {
 	mod("MinionModifier", "LIST", { mod = mod("Damage", "MORE", nil) }),
@@ -2783,6 +2805,16 @@ return {
 ["frost_wall_maximum_life"] = {
 	mod("IceCrystalLifeBase", "BASE", nil),
 },
+-- Parry
+["base_parry_buff_damage_taken_+%_final_to_apply"] = {
+	mod("DamageTaken", "MORE", nil, ModFlag.Attack, 0, { type = "GlobalEffect", effectType = "Debuff", effectName = "Parry Debuff", effectCond = "ParryActive" }, { type = "Condition", var = "Effective" }),
+	skill("parryDebuffBaseMagnitude", nil),
+	flag("CanParry"),
+},
+["base_parry_duration_ms"] = {
+	skill("parryDebuffDuration", nil),
+	div = 1000,
+},
 -- Other
 ["triggered_skill_damage_+%"] = {
 	mod("TriggeredDamage", "INC", nil, 0, 0, { type = "SkillType", skillType = SkillType.Triggered }),
@@ -2876,6 +2908,9 @@ return {
 ["apply_X_incision_on_hit"] = {
 	flag("Condition:CanInflictIncision", { type = "GlobalEffect", effectType = "Buff", effectName = "Incision" }),
 },
+["%_chance_to_apply_hounded_by_wisps_on_hit"] = {
+	flag("Condition:CanInflictFaerieFire", { type = "GlobalEffect", effectType = "Buff", effectName = "FaerieFire" }),
+},
 ["armour_break_physical_damage_%_dealt_as_armour_break"] = {
 	flag("Condition:CanArmourBreak", { type = "GlobalEffect", effectType = "Buff", effectName = "ArmourBreak" }),
 },
@@ -2965,6 +3000,9 @@ return {
 ["set_base_cannot_be_damaged"] = {
 	mod("DamageTaken", "MORE", nil),
 	value = -100,
+},
+["set_base_damage_taken_+%"] = {
+	mod("DamageTaken", "INC", nil),
 },
 --
 -- Gem Levels / quality

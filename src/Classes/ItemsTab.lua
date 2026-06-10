@@ -1729,10 +1729,22 @@ function ItemsTabClass:CopyAnointsAndAugments(newItem, copyAugments, overwrite, 
 				newItem.itemSocketCount = #newItem.sockets
 				newItem:UpdateRunes()
 			end
+
+			local validRunes = self:GetValidRunesForItem(newItem)
+
 			-- replace runes with current ones, or set to none
 			if shouldChangeAugments then
 				for i = 1, #newItem.sockets do
-					newItem.runes[i] = currentRunes[i] or "None"
+					newItem.runes[i] = "None"
+					if currentRunes[i] then
+						for _, rune in ipairs(validRunes) do
+							-- we only copy runes which fit the new item type
+							if rune.name == currentRunes[i] then
+								newItem.runes[i] = currentRunes[i]
+								break
+							end
+						end
+					end
 				end
 				newItem:UpdateRunes()
 			end
@@ -1900,10 +1912,8 @@ table.sort(runeModLines, function(a, b)
 		return a.group < b.group
 	end
 end)
--- Update rune selection controls
-function ItemsTabClass:UpdateRuneControls()
-	local item = self.displayItem
-	-- Build rune selection for item
+
+function ItemsTabClass:GetValidRunesForItem(item)
 	local runes = { }
 	for _, rune in pairs(runeModLines) do
 		local subType = item.base.subType and item.base.subType:lower()
@@ -1935,18 +1945,37 @@ function ItemsTabClass:UpdateRuneControls()
 				end
 		end
 	end
+	return runes
+end
+
+-- Update rune selection controls
+function ItemsTabClass:UpdateRuneControls()
+	local item = self.displayItem
+	-- Build rune selection for item
+	local runes = self:GetValidRunesForItem(item)
+	local runesUpdated = false
 
 	for i = 1, item.itemSocketCount do
 		self.controls["displayItemRune"..i].list = runes
 		if item.runes[i] then
+			local found = false
 			for j, modLine in ipairs(self.controls["displayItemRune"..i].list) do
 				if item.runes[i] == modLine.name then
 					self.controls["displayItemRune"..i].selIndex = j
+					found = true
 				end
+			end
+			if not found then
+				self.controls["displayItemRune"..i].selIndex = 1
+				item.runes[i] = "None"
+				runesUpdated = true
 			end
 		else
 			self.controls["displayItemRune"..i].selIndex = 1
 		end
+	end
+	if runesUpdated then
+		item:UpdateRunes()
 	end
 end
 
@@ -3208,7 +3237,7 @@ function ItemsTabClass:AddItemTooltip(tooltip, item, slot, dbMode, maxWidth)
 	else
 		tooltip:AddLine(fontSizeTitle, rarityCode..item.namePrefix..item.baseName:gsub(" %(.+%)","")..item.nameSuffix, "FONTIN SC")
 	end
-
+	tooltip.runicItem = item.runicItem
 	tooltip:AddSeparator(10)
 
 	-- Special fields for database items
@@ -3291,20 +3320,25 @@ function ItemsTabClass:AddItemTooltip(tooltip, item, slot, dbMode, maxWidth)
 	elseif base.armour then
 		-- Armour-specific info
 		local armourData = item.armourData
+		local level = self.build.characterLevel
+		local armour = item:GetArmourDataValue("Armour", level)
+		local evasion = item:GetArmourDataValue("Evasion", level)
+		local energyShield = item:GetArmourDataValue("EnergyShield", level)
+		local ward = item:GetArmourDataValue("Ward", level)
 		if base.armour.BlockChance and armourData.BlockChance > 0 then
 			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FChance to Block: %s%d%%", main:StatColor(armourData.BlockChance, base.armour.BlockChance), armourData.BlockChance), "FONTIN SC")
 		end
-		if armourData.Armour > 0 then
-			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FArmour: %s%d", main:StatColor(armourData.Armour, base.armour.ArmourBase), armourData.Armour), "FONTIN SC")
+		if armour > 0 then
+			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FArmour: %s%d", main:StatColor(armour, base.armour.ArmourBase), armour), "FONTIN SC")
 		end
-		if armourData.Evasion > 0 then
-			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FEvasion Rating: %s%d", main:StatColor(armourData.Evasion, base.armour.EvasionBase), armourData.Evasion), "FONTIN SC")
+		if evasion > 0 then
+			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FEvasion Rating: %s%d", main:StatColor(evasion, base.armour.EvasionBase), evasion), "FONTIN SC")
 		end
-		if armourData.EnergyShield > 0 then
-			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FEnergy Shield: %s%d", main:StatColor(armourData.EnergyShield, base.armour.EnergyShieldBase), armourData.EnergyShield), "FONTIN SC")
+		if energyShield > 0 then
+			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FEnergy Shield: %s%d", main:StatColor(energyShield, base.armour.EnergyShieldBase), energyShield), "FONTIN SC")
 		end
-		if armourData.Ward > 0 then
-			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FWard: %s%d", main:StatColor(armourData.Ward, base.armour.WardBase), armourData.Ward), "FONTIN SC")
+		if ward > 0 then
+			tooltip:AddLine(fontSizeBig, s_format("^x7F7F7FRunic Ward: %s%d", main:StatColor(ward, base.armour.WardBase), ward), "FONTIN SC")
 		end
 	elseif base.flask then
 		-- Flask-specific info
