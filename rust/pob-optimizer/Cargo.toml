@@ -1,0 +1,32 @@
+[package]
+name = "pob-optimizer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Production form of the parallel tree-optimizer search driver.
+#
+# The PoC (rust/pob-optimizer-poc) proved the load-bearing fact: N independent
+# LuaJIT states, each booting PoB's headless calc engine, run `calcs.perform` on
+# N threads with useful (sub-linear, ~3.4x ceiling) speedup. This crate turns
+# that into the shippable cdylib the design doc calls for:
+#
+#   * a PERSISTENT worker pool (booted once, reused across every diet round) —
+#     the PoC respawned per round, which production must not do.
+#   * a C-ABI FFI surface callable from the host LuaJIT via ffi.cdef/ffi.load:
+#     candidate node-id sets in, scalar scores out.
+#
+# See docs/rust-offload-poc.md ("Open items before productionizing").
+
+[lib]
+name = "pob_optimizer"
+# cdylib: a C-callable shared library (pob_optimizer.dll) loaded by the host
+# LuaJIT via ffi.load. No Rust ABI is exposed; the surface is the extern "C" fns
+# in src/ffi.rs.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Resolve LuaJIT symbols from the SHIPPED runtime/lua51.dll at runtime. Workers
+# MUST use the exact LuaJIT the host ships (same GC, same ABI) — linking our own
+# would be a second, incompatible runtime. (Proven model from the PoC.)
+libloading = "0.8"

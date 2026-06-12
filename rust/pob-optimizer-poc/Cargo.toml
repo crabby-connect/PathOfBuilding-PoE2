@@ -1,0 +1,28 @@
+[package]
+name = "pob-optimizer-poc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Proof-of-concept for the parallel tree-optimizer search driver
+# (see docs/tree-optimizer-design.md and docs/rust-offload-poc.md).
+#
+# Goal: prove the ONE fact that makes or breaks "offload search to Rust":
+# can we stand up N independent LuaJIT states inside Rust, each booting PoB's
+# headless calc engine, and run `perform` on N worker threads to get near-
+# linear speedup on the ~8ms-per-call bottleneck?
+#
+# It builds as a plain binary (not the eventual cdylib) so the PoC is runnable
+# stand-alone: `cargo run --release -- <reps> <threads>`. The production form
+# is a cdylib loaded via LuaJIT FFI from the main PoB state; the worker model
+# proven here is identical.
+
+[[bin]]
+name = "poc"
+path = "src/main.rs"
+
+[dependencies]
+# Resolve LuaJIT symbols from the SHIPPED runtime/lua51.dll at runtime, rather
+# than link-time against an import lib we don't have. This is also the correct
+# production model: workers must use the exact same LuaJIT the host ships.
+libloading = "0.8"
