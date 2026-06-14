@@ -122,6 +122,19 @@ pub struct BeamParams {
     pub detour: i64,
     pub patience_max: usize,
     pub max_rounds: usize,
+    /// Per-state jump-candidate cap, ranked by the power seed (power-per-point).
+    /// 0 => uncapped (every notable/keystone within max_jump becomes a candidate,
+    /// the old behavior). When >0, keep the top-K jump targets by seed power-per-
+    /// point (keystones always kept — their value is structural, not power-ranked).
+    /// Unlike the doc's distance-cap (which starved distant DAMAGE), ranking by real
+    /// per-node power lets a tight cap keep the FAR damage notables and drop junk.
+    pub max_jump_cand: usize,
+    /// Number of top-power distant clusters to seed as extra round-0 beam anchors
+    /// (besides the bare start). 0 => start-only (old behavior). Each anchor is the
+    /// start tree + the shortest path to one high-power target, so round 0 explores
+    /// genuinely-good far routes from step 1 instead of greedily wandering toward
+    /// near EHP (the local-optimum trap the design doc hit repeatedly).
+    pub seed_anchors: usize,
     /// Print step/round progress to stdout (the example wants it; the FFI path
     /// leaves it off so a GUI host isn't spammed).
     pub verbose: bool,
@@ -137,6 +150,8 @@ impl Default for BeamParams {
             detour: 50,
             patience_max: 2,
             max_rounds: 12,
+            max_jump_cand: 0, // 0 => uncapped
+            seed_anchors: 6,
             verbose: false,
         }
     }
@@ -146,7 +161,8 @@ impl BeamParams {
     /// Parse a newline- or comma-delimited `key=value` override string. Unknown
     /// keys error (catch typos early); absent keys keep the default. Keys:
     /// cap_points, beam_width, max_jump, pareto_extra, detour, patience_max,
-    /// max_rounds, verbose (0/1). Empty string => all defaults.
+    /// max_rounds, max_jump_cand, seed_anchors, verbose (0/1). Empty string =>
+    /// all defaults.
     pub fn parse(s: &str) -> Result<BeamParams, String> {
         let mut p = BeamParams::default();
         for raw in s.split(['\n', ',']) {
@@ -168,6 +184,8 @@ impl BeamParams {
                 "detour" => p.detour = num(val)?.max(1),
                 "patience_max" => p.patience_max = num(val)?.max(0) as usize,
                 "max_rounds" => p.max_rounds = num(val)?.max(0) as usize,
+                "max_jump_cand" => p.max_jump_cand = num(val)?.max(0) as usize,
+                "seed_anchors" => p.seed_anchors = num(val)?.max(0) as usize,
                 "verbose" => p.verbose = num(val)? != 0,
                 other => return Err(format!("beam params: unknown key '{other}'")),
             }
@@ -204,6 +222,84 @@ struct State {
     ehp: f64,
 }
 
+/// The one-time PowerBuilder-style seed: for each notable/keystone target, its real
+/// power-per-point — the penalized-score gain of adding ONLY that target (+ its
+/// shortest path) to the start tree, divided by the point cost. Computed once before
+/// round 0 in a single batch (~1s parallel, measured), independent of the diet bans.
+///
+/// This is the calc-based ranking the design doc names as "the only way to cap jump
+/// candidates without the quality hit" — a distant DAMAGE notable scores high here
+/// (real dps gain), distant junk scores low, so a tight `max_jump_cand` keeps the
+/// far damage the blind distance-cap starved.
+struct PowerSeed {
+    /// target id -> power-per-point (higher = better value). Absent => unreachable
+    /// or non-positive (treated as lowest rank).
+    ppp: HashMap<i32, f64>,
+}
+
+impl PowerSeed {
+    fn power(&self, id: i32) -> f64 {
+        self.ppp.get(&id).copied().unwrap_or(f64::NEG_INFINITY)
+    }
+}
+
+/// Score every notable/keystone target as a single-add from the start, in one batch,
+/// and rank by penalized power-per-point. `base` is the start-only [score, dps, ehp].
+fn compute_seed(
+    g: &Graph,
+    base: [f64; 3],
+    detour: i64,
+    memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+    total_evals: &mut usize,
+    score: &mut impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+) -> PowerSeed {
+    let start_set: HashSet<i32> = HashSet::from([g.start]);
+    // Shortest path (point cost) from the start to every reachable node, so a seed
+    // candidate is the start tree + the real travel path to the target (same as a
+    // beam jump), and power-per-point divides by that real cost.
+    let (pdist, prev) = paths_from_set(g, &start_set, &HashSet::new(), detour);
+    let base_pen = g.penalized_score(base[0], base[1], base[2]);
+
+    let mut targets: Vec<(i32, Vec<i32>, usize)> = Vec::new();
+    for (&tid, &d) in &pdist {
+        if d >= 1
+            && tid != g.start
+            && matches!(g.ty.get(&tid), Some(&T_NOTABLE | &T_KEYSTONE))
+        {
+            let path = path_to(&prev, &start_set, tid);
+            if path.is_empty() {
+                continue;
+            }
+            let mut ids: Vec<i32> = start_set.iter().copied().chain(path.iter().copied()).collect();
+            ids.sort_unstable();
+            targets.push((tid, ids, d));
+        }
+    }
+
+    let to_score: Vec<Vec<i32>> =
+        targets.iter().map(|(_, ids, _)| ids.clone()).filter(|s| !memo.contains_key(s)).collect();
+    if !to_score.is_empty() {
+        let scores = score(&to_score);
+        *total_evals += to_score.len();
+        for (s, sc) in to_score.iter().zip(scores.iter()) {
+            memo.insert(s.clone(), *sc);
+        }
+    }
+
+    let mut ppp: HashMap<i32, f64> = HashMap::new();
+    for (tid, ids, d) in &targets {
+        let sc = memo[ids];
+        let pen = g.penalized_score(sc[0], sc[1], sc[2]);
+        if pen.is_finite() {
+            // Gain over the start tree, per point spent reaching the target. Keystones
+            // can have a structural value the single-add misses, so they are kept
+            // regardless of rank (see run_beam); ppp only orders the cap.
+            ppp.insert(*tid, (pen - base_pen) / (*d as f64));
+        }
+    }
+    PowerSeed { ppp }
+}
+
 /// Run the full beam + elimination diet. `score(&[set])` returns [score, dps, ehp]
 /// per set (NAN on failure) — the only contact with the calc engine. Memoizes by
 /// id-set across all rounds (overlapping frontiers re-produce the same sets).
@@ -215,6 +311,11 @@ pub fn optimize(
     let (cap_points, pareto_extra) = params.resolved(graph);
     let mut memo: HashMap<Vec<i32>, [f64; 3]> = HashMap::new();
     let mut total_evals = 0usize;
+
+    // One-time power seed (before round 0): ranks distant jump targets by REAL power
+    // so the beam can escape the near-EHP local optimum. Reused across all diet rounds.
+    let seed_base = score_or_memo(&[graph.start], &mut memo, &mut total_evals, &mut score);
+    let seed = compute_seed(graph, seed_base, params.detour, &mut memo, &mut total_evals, &mut score);
 
     macro_rules! log {
         ($($a:tt)*) => { if params.verbose { println!($($a)*); } };
@@ -232,6 +333,7 @@ pub fn optimize(
     log!("ROUND 0 (unconstrained)");
     let mut best = run_beam(
         graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
+        params.max_jump_cand, params.seed_anchors, &seed,
         &HashSet::new(), params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
     );
     repenalize(&mut best);
@@ -269,6 +371,7 @@ pub fn optimize(
         log!("  round {round}: ban {} (marginal {:+.1})", victim.id, victim.marginal);
         let mut r = run_beam(
             graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
+            params.max_jump_cand, params.seed_anchors, &seed,
             &trial, params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
         );
         repenalize(&mut r);
@@ -309,6 +412,9 @@ fn run_beam(
     beam_width: usize,
     max_jump: usize,
     pareto_extra: usize,
+    max_jump_cand: usize,
+    seed_anchors: usize,
+    seed: &PowerSeed,
     excluded: &HashSet<i32>,
     detour: i64,
     memo: &mut HashMap<Vec<i32>, [f64; 3]>,
@@ -320,13 +426,60 @@ fn run_beam(
     let base = score_or_memo(&[g.start], memo, total_evals, score);
     let mut beam = vec![State {
         ids: vec![g.start],
-        set: start_set,
+        set: start_set.clone(),
         score: base[0],
         dps: base[1],
         ehp: base[2],
     }];
 
     let targetable = |v: i32| g.is_target(v) && !excluded.contains(&v);
+
+    // Multi-anchor seeding: besides the bare start, seed the beam with states anchored
+    // on the top-power distant targets (by seed power-per-point), so round 0 commits to
+    // genuinely-good far routes from step 1 instead of greedily climbing near EHP. Each
+    // anchor = start tree + the shortest path to one high-power target (within budget,
+    // not soft-banned). Scored in one batch with the base.
+    if seed_anchors > 0 {
+        let (pdist, prev) = paths_from_set(g, &start_set, excluded, detour);
+        let mut ranked: Vec<(i32, usize)> = pdist
+            .iter()
+            .filter(|(&tid, &d)| {
+                d >= 1 && d <= cap_points && tid != g.start && targetable(tid) && seed.power(tid).is_finite()
+            })
+            .map(|(&tid, &d)| (tid, d))
+            .collect();
+        ranked.sort_by(|a, b| seed.power(b.0).partial_cmp(&seed.power(a.0)).unwrap());
+
+        let mut anchor_sets: Vec<(Vec<i32>, HashSet<i32>)> = Vec::new();
+        for (tid, _) in ranked.into_iter().take(seed_anchors) {
+            let path = path_to(&prev, &start_set, tid);
+            if path.is_empty() {
+                continue;
+            }
+            let mut set = start_set.clone();
+            for &a in &path {
+                set.insert(a);
+            }
+            let mut ids: Vec<i32> = set.iter().copied().collect();
+            ids.sort_unstable();
+            anchor_sets.push((ids, set));
+        }
+        let to_score: Vec<Vec<i32>> =
+            anchor_sets.iter().map(|(ids, _)| ids.clone()).filter(|s| !memo.contains_key(s)).collect();
+        if !to_score.is_empty() {
+            let scores = score(&to_score);
+            *total_evals += to_score.len();
+            for (s, sc) in to_score.iter().zip(scores.iter()) {
+                memo.insert(s.clone(), *sc);
+            }
+        }
+        for (ids, set) in anchor_sets {
+            let sc = memo[&ids];
+            if sc[0].is_finite() {
+                beam.push(State { ids, set, score: sc[0], dps: sc[1], ehp: sc[2] });
+            }
+        }
+    }
 
     for step in 1..=cap_points {
         let mut cand_sets: Vec<Vec<i32>> = Vec::new();
@@ -357,7 +510,12 @@ fn run_beam(
                     }
                 }
             }
-            // (b) path-jumps to a notable/keystone within maxJump (and within budget)
+            // (b) path-jumps to a notable/keystone within maxJump (and within budget).
+            // Collect (target, isKeystone) first so we can power-rank/cap them before
+            // materializing paths. With max_jump_cand>0 we keep the top-K notables by
+            // seed power-per-point (keystones always kept — structural value the single-
+            // add seed can miss), which lets a tight cap retain FAR damage and drop junk.
+            let mut jump_targets: Vec<i32> = Vec::new();
             for (&tid, &d) in &pdist {
                 if !st.set.contains(&tid)
                     && d >= 2
@@ -365,8 +523,21 @@ fn run_beam(
                     && targetable(tid)
                     && matches!(g.ty.get(&tid), Some(&T_NOTABLE | &T_KEYSTONE))
                 {
-                    moves.push(path_to(&prev, &st.set, tid));
+                    jump_targets.push(tid);
                 }
+            }
+            if max_jump_cand > 0 && jump_targets.len() > max_jump_cand {
+                let is_keystone = |id: i32| matches!(g.ty.get(&id), Some(&T_KEYSTONE));
+                // Keep all keystones; rank the rest by seed power-per-point, keep top-K.
+                let mut notables: Vec<i32> =
+                    jump_targets.iter().copied().filter(|&id| !is_keystone(id)).collect();
+                notables.sort_by(|a, b| seed.power(*b).partial_cmp(&seed.power(*a)).unwrap());
+                notables.truncate(max_jump_cand);
+                jump_targets.retain(|&id| is_keystone(id));
+                jump_targets.extend(notables);
+            }
+            for tid in jump_targets {
+                moves.push(path_to(&prev, &st.set, tid));
             }
 
             for add in moves {
@@ -706,5 +877,53 @@ mod tests {
         // penalty_k=0 => identity (old behavior): returns the growth arg verbatim.
         let g0 = Graph { penalty_k: 0.0, ..g };
         assert_eq!(g0.penalized_score(42.0, 1.0, 1.0), 42.0);
+    }
+
+    /// A "Y" graph: start(0) branches to a NEAR junk notable (1, low score) and,
+    /// through a travel chain (2->3), to a FAR high-value notable (4). With a 1-wide
+    /// beam and a 1-jump-candidate cap, a blind (distance-first) selection would keep
+    /// the near junk and never reach the far prize; the power seed ranks node 4 highest
+    /// (real gain per point), so the cap keeps the FAR damage. budget=3 reaches it.
+    fn y_graph() -> Graph {
+        let mut links = HashMap::new();
+        let mut ty = HashMap::new();
+        // 0 start; 1 near junk notable; 2,3 travel-ish notables on the way to 4; 4 prize.
+        for id in 0..=4 {
+            ty.insert(id, T_NOTABLE);
+        }
+        links.insert(0, vec![1, 2]);
+        links.insert(1, vec![0]);
+        links.insert(2, vec![0, 3]);
+        links.insert(3, vec![2, 4]);
+        links.insert(4, vec![3]);
+        Graph {
+            start: 0, budget: 3, links, ty,
+            ref_dps: 1.0, ref_ehp: 1.0, w_dps: 1.0, w_ehp: 1.0, penalty_k: 0.0,
+        }
+    }
+
+    #[test]
+    fn seed_cap_keeps_far_high_power_target() {
+        let g = y_graph();
+        // Score: node 4 is worth a lot; everything else is worth little. (penalty_k=0
+        // so growth score is returned verbatim; dps/ehp mirror the score so nothing is
+        // flagged an enabler.) The set's value = max single-node value present.
+        let score = |cands: &[Vec<i32>]| -> Vec<[f64; 3]> {
+            cands
+                .iter()
+                .map(|c| {
+                    let v = if c.contains(&4) { 100.0 } else { c.len() as f64 };
+                    [v, v, v]
+                })
+                .collect()
+        };
+        // Narrowest possible beam + tightest jump cap: only the power seed steers it.
+        let params = BeamParams {
+            cap_points: 3, beam_width: 1, max_jump: 4, pareto_extra: 0,
+            max_jump_cand: 1, seed_anchors: 2, ..Default::default()
+        };
+        let res = optimize(&g, &params, score);
+        assert!(res.ids.contains(&4), "seed-capped beam failed to reach the far prize: {:?}", res.ids);
+        assert_eq!(res.score, 100.0);
     }
 }

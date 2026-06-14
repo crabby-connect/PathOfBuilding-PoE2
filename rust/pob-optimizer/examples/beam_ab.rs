@@ -70,6 +70,10 @@ fn main() {
     let w_ehp: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     // penaltyK arg (optional): quadratic regression-penalty strength. Default 5 (lenient).
     let penalty_k: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    // Seed-driven beam knobs, set via env so they don't disturb the positional args
+    // (handy for A/B): MAX_JUMP_CAND (0=uncapped), SEED_ANCHORS (round-0 power anchors).
+    let max_jump_cand: usize = std::env::var("MAX_JUMP_CAND").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let seed_anchors: usize = std::env::var("SEED_ANCHORS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
 
     let root = locate_repo_root().expect("locate repo root (need src/ + runtime/)");
     let fwd = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
@@ -182,11 +186,53 @@ fn main() {
         assert!(max_diff < 1e-6, "parallel scoring changed the answer (diff {max_diff:.3e})");
 
         // ============================================================================
+        // 1b. POWER-SEED COST — one single-add eval per notable/keystone target, in ONE
+        //     parallel batch. This is the cost of a PowerBuilder-style seed pass the beam
+        //     could use to rank distant jump targets by real power-per-point (instead of
+        //     the blind maxJump distance wall). Each candidate is [start, target], so the
+        //     worker does exactly one calcFunc({addNodes={target+path}}) — identical unit
+        //     cost to a beam eval. Measures the REAL wall-time of seeding on this box.
+        //     NOTE: the worker dedups its OWN calc by modKey internally, but distinct ids
+        //     with the same modKey still cost one FFI round-trip each here, so this is an
+        //     UPPER bound vs. a modKey-deduped seed (the doc's 1,415 unique of 3,228).
+        // ============================================================================
+        let seed_targets: Vec<i32> = graph
+            .ty
+            .iter()
+            .filter(|(&id, &t)| (t == T_NOTABLE || t == T_KEYSTONE) && id != graph.start)
+            .map(|(&id, _)| id)
+            .collect();
+        let seed_batch: Vec<Vec<i32>> = seed_targets
+            .iter()
+            .map(|&id| {
+                let mut v = vec![graph.start, id];
+                v.sort_unstable();
+                v
+            })
+            .collect();
+        println!(
+            "\n=== POWER-SEED COST: {} notable/keystone single-add evals (1 batch) ===",
+            seed_batch.len()
+        );
+        let t_seed = Instant::now();
+        let seed_scores = score_batch3(pool, &seed_batch);
+        let seed_dt = t_seed.elapsed().as_secs_f64();
+        let finite = seed_scores.iter().filter(|s| s[0].is_finite()).count();
+        println!(
+            "  seed pass ({nw} workers)   : {seed_dt:.2}s  ({:.2} ms/target, {finite}/{} finite)",
+            seed_dt * 1000.0 / seed_batch.len().max(1) as f64,
+            seed_batch.len()
+        );
+        println!(
+            "  => a parallel PowerBuilder seed costs ~{seed_dt:.1}s of fixed startup (vs. the multi-minute full search)."
+        );
+
+        // ============================================================================
         // 2. FULL SEARCH — the production beam + diet, via the pob_opt_run_beam FFI.
         // ============================================================================
         let cap_points = if cap_arg > 0 { cap_arg } else { budget };
         let params = format!(
-            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max=2,max_rounds=12,verbose=1"
+            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max=2,max_rounds=12,max_jump_cand={max_jump_cand},seed_anchors={seed_anchors},verbose=1"
         );
         println!("\n=== FULL BEAM + DIET via pob_opt_run_beam (P={cap_points}, beam={beam_width}) ===");
         let t_beam = Instant::now();

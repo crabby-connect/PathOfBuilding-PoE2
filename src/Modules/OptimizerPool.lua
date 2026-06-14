@@ -182,8 +182,10 @@ end
 -- scoreFn = "__pob_score_cleanslate" (so it has tree topology and 3-axis scoring).
 --
 -- `params` is an optional table of beam tunables (any subset):
---   capPoints, beamWidth, maxJump, paretoExtra, detour, patienceMax, maxRounds, verbose
--- 0/absent keeps the Rust default (capPoints 0 => the build's real budget).
+--   capPoints, beamWidth, maxJump, paretoExtra, detour, patienceMax, maxRounds,
+--   maxJumpCand, seedAnchors, verbose
+-- 0/absent keeps the Rust default (capPoints 0 => the build's real budget;
+-- maxJumpCand 0 => uncapped jumps; seedAnchors => power-seeded round-0 anchors).
 --
 -- Returns a table { ids = { nodeId, ... }, score = n, dps = n, ehp = n }, or
 -- nil + error string on failure. `ids` includes the class start, sorted.
@@ -193,7 +195,8 @@ function OptimizerPool:runBeam(params)
 	local keyMap = {
 		capPoints = "cap_points", beamWidth = "beam_width", maxJump = "max_jump",
 		paretoExtra = "pareto_extra", detour = "detour", patienceMax = "patience_max",
-		maxRounds = "max_rounds", verbose = "verbose",
+		maxRounds = "max_rounds", maxJumpCand = "max_jump_cand",
+		seedAnchors = "seed_anchors", verbose = "verbose",
 	}
 	local lines = { }
 	for luaKey, cKey in pairs(keyMap) do
