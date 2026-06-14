@@ -122,6 +122,26 @@ node. A **build-enabler guard** marks any node whose removal collapses an axis (
 or ehp drops below 1% of full) as MANDATORY — never banned (e.g. Hollow Palm Technique, which
 enables this Monk's unarmed playstyle; banning it gives dps=0).
 
+Now that throughput is solved, `patience_max` defaults to **8** and `max_rounds` to **40** (was
+2/12) — the diet runs long and bans hard, since a few low-marginal misses no longer justify
+stopping. Both are overridable in `beam_ab` via `PATIENCE_MAX` / `MAX_ROUNDS` env for sweeps.
+
+**Dead-leaf reclaim (batch, free).** A notable *or keystone* that is a *leaf* of the allocation
+(≤1 allocated neighbour, so it carries no travel for any other node) **and** contributes ≤0
+marginal is a wasted point — e.g. a notable like "Splinters" hanging off the edge whose stats do
+nothing for the build. At the top of each diet round, **all** such leaves are collected and banned
+*together*, then the full beam re-runs **once** with the whole leaf set excluded — one full-algo
+run per round, never one run per dead leaf. Accept iff the re-grown tree does not regress (≥ best,
+not strictly >), since shedding dead leaves and re-spending their points is a structural win even
+at a tie; no patience tick either way. The bans are permanent (those leaves won't return as
+targets), so the set strictly shrinks and the pass terminates. Only when a round finds *no* dead
+leaves does it fall through to the normal single lowest-marginal ban. The leaf test
+(`is_alloc_leaf`) is what protects the main path: a load-bearing node has ≥2 allocated neighbours
+and never qualifies — type is irrelevant to safety. A non-leaf worthless node is still removable by
+the normal diet, just not unconditionally. (The normal diet requires *strict* improvement, so a
+dead leaf that's only a *tie* to drop — exactly the Splinters case — slips past it; the relaxed
+accept-on-tie reclaim is what catches it.)
+
 **Score shape.** The worker returns a *growth* score `100·(wDPS·dps/refDps + wEHP·ehp/refEhp)`,
 monotonic in both axes so the beam can climb from the start-only tree. The DPS/EHP **regression
 penalty** vs. the original build is applied by the Rust beam to full-budget trees only
@@ -189,7 +209,8 @@ $env:PATH = "$PWD\runtime;$env:PATH"
 cargo run --release --manifest-path rust/pob-optimizer/Cargo.toml --example beam_ab `
     -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp] [penaltyK]
 # defaults: workers=auto, capPoints=0 (real budget), beamWidth=8, out=mymonk_optimized.xml,
-#           wDps=1, wEhp=1, penaltyK=5.  env: SEED_ANCHORS (default 6), MAX_JUMP_CAND (0=uncapped)
+#           wDps=1, wEhp=1, penaltyK=5.  env: SEED_ANCHORS (default 6), MAX_JUMP_CAND (0=uncapped),
+#           PATIENCE_MAX (default 8), MAX_ROUNDS (default 40)
 ```
 The harness prints the LIVE BASELINE (the build's own dps/ehp), runs a microbenchmark + power-seed
 cost pass, then the full beam + diet, and saves the winner to `src/Builds/<outFile>`.

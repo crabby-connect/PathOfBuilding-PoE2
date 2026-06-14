@@ -270,8 +270,12 @@ fn main() {
         // 2. FULL SEARCH — the production beam + diet, via the pob_opt_run_beam FFI.
         // ============================================================================
         let cap_points = if cap_arg > 0 { cap_arg } else { budget };
+        // patience_max / max_rounds inherit the crate defaults (now 8 / 40) unless
+        // overridden via env, so the harness can sweep them without a recompile.
+        let patience_max: usize = std::env::var("PATIENCE_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let max_rounds: usize = std::env::var("MAX_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
         let params = format!(
-            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max=2,max_rounds=12,max_jump_cand={max_jump_cand},seed_anchors={seed_anchors},verbose=1"
+            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max={patience_max},max_rounds={max_rounds},max_jump_cand={max_jump_cand},seed_anchors={seed_anchors},verbose=1"
         );
         println!("\n=== FULL BEAM + DIET via pob_opt_run_beam (P={cap_points}, beam={beam_width}) ===");
         let t_beam = Instant::now();

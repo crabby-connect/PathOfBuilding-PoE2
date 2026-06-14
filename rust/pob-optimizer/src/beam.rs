@@ -148,8 +148,11 @@ impl Default for BeamParams {
             max_jump: 12,
             pareto_extra: 0, // 0 => max(4, beam_width/2)
             detour: 50,
-            patience_max: 2,
-            max_rounds: 12,
+            // Throughput is no longer the bottleneck (worker pool + memoization), so
+            // the diet runs long and bans hard: a handful of consecutive low-marginal
+            // misses no longer means "stop" — keep probing deeper droppable nodes.
+            patience_max: 8,
+            max_rounds: 40,
             max_jump_cand: 0, // 0 => uncapped
             seed_anchors: 6,
             verbose: false,
@@ -347,16 +350,76 @@ pub fn optimize(
     let mut patience = 0usize;
     let mut round = 0usize;
 
-    // Elimination diet: ban the lowest-marginal droppable node, re-optimize, keep
-    // the ban iff it improved; else revert + tick patience. Enablers (removal
-    // collapses an axis) are never banned. Soft-ban: pathing may still detour
-    // through a banned node, it just can't be targeted.
+    // Elimination diet. Each round, in order:
+    //
+    //   (a) DEAD-LEAF reclaim (batch, no patience cost). Every notable/keystone that
+    //       is a LEAF of the allocation (≤1 allocated neighbour, so it carries no
+    //       travel for any other node) AND contributes ≤0 marginal is a wasted point.
+    //       Ban ALL of them at once and re-run the full beam ONCE with the whole leaf
+    //       set excluded — one full-algo run per round, not one per dead leaf. The
+    //       leaf test is what protects the main path: a load-bearing node has ≥2
+    //       allocated neighbours and never qualifies. Accept iff the re-grown tree
+    //       does not regress (≥ best, not strictly >) — shedding dead leaves and
+    //       re-spending their points is a structural win even at a tie. No patience
+    //       tick either way; this is opportunistic cleanup, not a real probe.
+    //
+    //   (b) NORMAL ban. If no dead leaves remained, ban the single lowest-marginal
+    //       droppable node, re-optimize, keep the ban iff it strictly improved; else
+    //       revert + tick patience. Enablers (removal collapses an axis) are never
+    //       banned. Bans are SOFT: pathing may still detour through a banned node, it
+    //       just can't be targeted.
     while round < params.max_rounds && patience < params.patience_max {
         round += 1;
         let marg = analyze_marginals(graph, &best, &mut memo, &mut total_evals, &mut score);
+        let droppable = |m: &&Marginal| {
+            !m.is_enabler && !banned.contains(&m.id) && !tried.contains(&m.id)
+        };
+
+        // (a) Collect EVERY dead-leaf notable/keystone and shed them together. A
+        // worthless LEAF tip (notable or keystone) is a wasted point regardless of
+        // type — e.g. a notable like "Splinters" hanging off the edge whose stats do
+        // nothing for this build. The leaf test (≤1 allocated neighbour) is what keeps
+        // this safe: a load-bearing node has ≥2 allocated neighbours and never
+        // qualifies, so the main travel route is never corrupted.
+        let dead_leaves: Vec<i32> = marg
+            .iter()
+            .filter(droppable)
+            .filter(|m| {
+                matches!(graph.ty.get(&m.id), Some(&T_NOTABLE | &T_KEYSTONE))
+                    && m.marginal <= 1e-6
+                    && is_alloc_leaf(graph, &best.set, m.id)
+            })
+            .map(|m| m.id)
+            .collect();
+        if !dead_leaves.is_empty() {
+            let mut trial = banned.clone();
+            trial.extend(dead_leaves.iter().copied());
+            log!("  round {round}: reclaim {} DEAD LEAF node(s) {:?}", dead_leaves.len(), dead_leaves);
+            let mut r = run_beam(
+                graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
+                params.max_jump_cand, params.seed_anchors, &seed,
+                &trial, params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
+            );
+            repenalize(&mut r);
+            if r.score >= best.score - 1e-6 {
+                log!("    RECLAIMED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping bans.", best.score, r.score, r.dps, r.ehp);
+                best = r;
+                banned = trial; // permanent: these dead leaves won't return as targets
+                tried.clear();
+            } else {
+                // Regressed (rare — re-fill couldn't recover): keep the bans anyway so
+                // we don't re-detect the same dead leaves next round, but don't adopt
+                // the worse tree. The normal diet below will work from the old best.
+                log!("    leaf reclaim regressed ({:.1} vs {:.1}). Banning targets but keeping tree.", r.score, best.score);
+                banned = trial;
+            }
+            continue; // one full run this round; re-analyze marginals fresh next round
+        }
+
+        // (b) No dead leaves left — normal single lowest-marginal ban.
         let victim = marg
             .iter()
-            .filter(|m| !m.is_enabler && !banned.contains(&m.id) && !tried.contains(&m.id))
+            .filter(droppable)
             .min_by(|a, b| a.marginal.partial_cmp(&b.marginal).unwrap());
         let victim = match victim {
             Some(v) => v.clone(),
@@ -376,10 +439,7 @@ pub fn optimize(
         );
         repenalize(&mut r);
         if r.score > best.score + 1e-6 {
-            log!(
-                "    IMPROVED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping ban.",
-                best.score, r.score, r.dps, r.ehp
-            );
+            log!("    IMPROVED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping ban.", best.score, r.score, r.dps, r.ehp);
             best = r;
             banned = trial;
             patience = 0;
@@ -619,6 +679,22 @@ struct Marginal {
     is_enabler: bool,
 }
 
+/// Is `id` a LEAF of the allocated subtree `set` — i.e. exactly one of its tree
+/// neighbours is allocated? A leaf carries no travel for any other allocated node,
+/// so dropping it strands nothing; a node with ≥2 allocated neighbours may be on
+/// the main path and is structurally load-bearing. The start is never a leaf.
+fn is_alloc_leaf(g: &Graph, set: &HashSet<i32>, id: i32) -> bool {
+    if id == g.start {
+        return false;
+    }
+    let allocated_neighbours = g
+        .links
+        .get(&id)
+        .map(|adj| adj.iter().filter(|n| set.contains(n)).count())
+        .unwrap_or(0);
+    allocated_neighbours <= 1
+}
+
 /// For each notable/keystone in `best`, measure marginal = best.score − score(best
 /// without that node), and flag enablers (leave-one-out dps or ehp < 1% of best's).
 /// Scores the leave-one-out sets in ONE batch (the throughput win paying off).
@@ -821,6 +897,23 @@ mod tests {
             w_ehp: 1.0,
             penalty_k: 0.0,
         }
+    }
+
+    #[test]
+    fn alloc_leaf_protects_the_main_path() {
+        // Line 0-1-2-3, all allocated. Only the two ends are leaves; the interior
+        // nodes carry travel for the far end and must NOT read as leaves (dropping
+        // one would strand everything past it — "corrupt the main path").
+        let g = line_graph();
+        let set: HashSet<i32> = [0, 1, 2, 3].into_iter().collect();
+        assert!(!is_alloc_leaf(&g, &set, 0), "start is never a leaf");
+        assert!(!is_alloc_leaf(&g, &set, 1), "interior node is load-bearing");
+        assert!(!is_alloc_leaf(&g, &set, 2), "interior node is load-bearing");
+        assert!(is_alloc_leaf(&g, &set, 3), "the far end IS a droppable leaf");
+        // Drop the far end: now node 2 becomes the new leaf.
+        let set2: HashSet<i32> = [0, 1, 2].into_iter().collect();
+        assert!(is_alloc_leaf(&g, &set2, 2));
+        assert!(!is_alloc_leaf(&g, &set2, 1));
     }
 
     #[test]
