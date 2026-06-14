@@ -141,6 +141,13 @@ fn main() {
             "graph: {} nodes, start id {}, {} notable/keystone targets, build budget P={}",
             graph.links.len(), graph.start, n_targets, budget
         );
+        // The fair same-config baseline: the LIVE build's own real dps/ehp (calcBase, no
+        // overrides). The search winner below is apples-to-apples vs THESE numbers — NOT the
+        // start-only round-0 base, and NOT any stale doc figure.
+        match (graph.ref_dps, graph.ref_ehp) {
+            (Some(d), Some(e)) => println!("LIVE BASELINE (current build as-is): dps={d:.1}  ehp={e:.1}  (P={budget})"),
+            _ => println!("LIVE BASELINE: <trailer absent — rebuild the cdylib to emit refDps/refEhp>"),
+        }
 
         let score_batch3 = |pool: *mut std::ffi::c_void, cands: &[Vec<i32>]| -> Vec<[f64; 3]> {
             if cands.is_empty() {
@@ -152,6 +159,38 @@ fn main() {
             assert_eq!(rc, 0, "score_batch3 rc={rc}: {}", read_err());
             (0..cands.len()).map(|k| [out[k * 3], out[k * 3 + 1], out[k * 3 + 2]]).collect()
         };
+
+        // ---- SELF-CONSISTENCY PROBE (opt-in via LIVE_IDS) ---------------------------
+        // Score the live build's OWN main-tree id set through the clean-slate override
+        // (__pob_score_cleanslate, the exact path the beam uses) and check it reproduces
+        // the LIVE BASELINE above. If dps/ehp here != refDps/refEhp, the addNodes+
+        // removeCurrent override is mis-scoring (e.g. double-counting a defensive layer),
+        // which would explain a winner whose ehp reads implausibly high. Pass the live
+        // build's `nodes=` ids comma-separated in LIVE_IDS to run it.
+        if let Ok(live) = std::env::var("LIVE_IDS") {
+            let mut ids: Vec<i32> = live.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            println!("\n=== SELF-CONSISTENCY PROBE: clean-slate re-score of live set ({} ids) ===", ids.len());
+            let r = score_batch3(pool, std::slice::from_ref(&ids));
+            let [sc, dps, ehp] = r[0];
+            println!("  clean-slate re-score : dps={dps:.1}  ehp={ehp:.1}  (growth score {sc:.1})");
+            match (graph.ref_dps, graph.ref_ehp) {
+                (Some(rd), Some(re)) => {
+                    let ddps = (dps - rd).abs();
+                    let dehp = (ehp - re).abs();
+                    println!("  live baseline        : dps={rd:.1}  ehp={re:.1}");
+                    let tol_d = (rd.abs() * 0.01).max(1.0);
+                    let tol_e = (re.abs() * 0.01).max(1.0);
+                    println!(
+                        "  delta                : dps {:+.1} ({}), ehp {:+.1} ({})",
+                        dps - rd, if ddps <= tol_d { "MATCH" } else { "!! MISMATCH" },
+                        ehp - re, if dehp <= tol_e { "MATCH" } else { "!! MISMATCH" },
+                    );
+                }
+                _ => println!("  (no baseline trailer to compare against)"),
+            }
+        }
 
         // ============================================================================
         // 1. MICROBENCHMARK — same batch, parallel pool vs single-threaded (1 worker).
@@ -287,6 +326,13 @@ struct MiniGraph {
     budget: usize,
     links: std::collections::HashMap<i32, Vec<i32>>,
     ty: std::collections::HashMap<i32, i32>,
+    /// The ORIGINAL (live) build's real dps/ehp — the trailer's refDps/refEhp, the
+    /// fair same-config baseline the search winner should be compared against. These
+    /// are calcBase with no overrides (the build exactly as currently allocated), so
+    /// they ARE the live build's numbers, not the start-only tree. None if the worker
+    /// is an older build that didn't emit the trailer.
+    ref_dps: Option<f64>,
+    ref_ehp: Option<f64>,
 }
 
 fn parse_graph(flat: &[i32]) -> MiniGraph {
@@ -309,7 +355,14 @@ fn parse_graph(flat: &[i32]) -> MiniGraph {
         links.insert(id, adj);
         ty.insert(id, tc);
     }
-    MiniGraph { start, budget, links, ty }
+    // TRAILER (after the node data): [ refDps*1000, refEhp*1000, wDps*1000, wEhp*1000,
+    // penaltyK*1000 ] — see worker_bootstrap.lua __pob_graph_export. We only need the refs.
+    let (ref_dps, ref_ehp) = if flat.len() >= p + 2 {
+        (Some(flat[p] as f64 / 1000.0), Some(flat[p + 1] as f64 / 1000.0))
+    } else {
+        (None, None)
+    };
+    MiniGraph { start, budget, links, ty, ref_dps, ref_ehp }
 }
 
 impl MiniGraph {

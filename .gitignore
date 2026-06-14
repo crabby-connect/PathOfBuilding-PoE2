@@ -54,6 +54,7 @@ src/poe_api_response.json
 beam_*.log
 spike_*.log
 smoke_*.log
+full_*.log
 *.network-response
 poe_ninja_*.json
 memory/
