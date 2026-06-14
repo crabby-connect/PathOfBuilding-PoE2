@@ -11,6 +11,7 @@
 //! feeds. The public surface is in `ffi` (extern "C", called via LuaJIT FFI);
 //! everything else is internal.
 
+pub mod beam;
 mod config;
 mod ffi;
 mod lua;
@@ -19,6 +20,6 @@ mod pool;
 // Re-export the FFI entry points so they are exported from the cdylib.
 pub use ffi::{
     pob_opt_call_save, pob_opt_candidate_ids, pob_opt_create, pob_opt_destroy,
-    pob_opt_last_error, pob_opt_score_batch, pob_opt_score_batch3, pob_opt_worker_count,
-    PobOptPool,
+    pob_opt_last_error, pob_opt_run_beam, pob_opt_score_batch, pob_opt_score_batch3,
+    pob_opt_worker_count, PobOptPool,
 };

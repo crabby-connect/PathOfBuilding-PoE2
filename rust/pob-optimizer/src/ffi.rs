@@ -285,6 +285,91 @@ pub unsafe extern "C" fn pob_opt_call_save(
     }
 }
 
+/// Run the FULL clean-slate beam + Pareto + elimination-diet search inside the
+/// pool and return the winning passive-tree node-id set. This is the production
+/// search (the same one `examples/beam_ab.rs` drives); the host just kicks it off
+/// and reads back a result instead of orchestrating the loop on its single state.
+///
+/// The pool MUST have been created with `candidate_fn=__pob_graph_export` and
+/// `score_fn=__pob_score_cleanslate` (so candidate_ids hands back the flat graph
+/// and scoring returns score/dps/ehp); otherwise the search has no topology and
+/// this returns -1.
+///
+/// `params` is a newline/comma `key=value` override string (or NULL/empty for all
+/// defaults) — keys: cap_points, beam_width, max_jump, pareto_extra, detour,
+/// patience_max, max_rounds, verbose. See `beam::BeamParams::parse`.
+///
+/// `out_ids` is sized by the caller to `cap` int32s; the winning ids (incl. the
+/// class start, sorted) are written there. Returns the TOTAL winning id count
+/// (call once with cap=0/out_ids=NULL to size, then again to fetch), or -1 on
+/// error (see pob_opt_last_error). `out_stats`, if non-NULL, receives 3 doubles:
+/// [score, dps, ehp] of the winning build.
+///
+/// # Safety
+/// `pool` must be a live handle. `params` is a NUL-terminated C string or NULL.
+/// `out_ids` must point to `cap` int32s (or be NULL iff cap==0); `out_stats` must
+/// point to 3 doubles or be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn pob_opt_run_beam(
+    pool: *mut PobOptPool,
+    params: *const c_char,
+    out_ids: *mut i32,
+    cap: c_int,
+    out_stats: *mut c_double,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<crate::beam::BeamResult, String> {
+        if pool.is_null() {
+            return Err("run_beam: pool is NULL".into());
+        }
+        let params_str = if params.is_null() {
+            ""
+        } else {
+            CStr::from_ptr(params)
+                .to_str()
+                .map_err(|_| "run_beam: params is not valid UTF-8".to_string())?
+        };
+        let beam_params = crate::beam::BeamParams::parse(params_str)?;
+
+        let pool = &(*pool).pool;
+        let flat = pool.candidate_ids();
+        if flat.len() < 3 {
+            return Err(
+                "run_beam: no graph exported (create the pool with candidate_fn=__pob_graph_export)"
+                    .into(),
+            );
+        }
+        let graph = crate::beam::Graph::parse(flat);
+
+        // The search's only contact with the engine: batch-score via the pool.
+        let res = crate::beam::optimize(&graph, &beam_params, |cands| pool.score_batch3(cands));
+        Ok(res)
+    }));
+    match result {
+        Ok(Ok(res)) => {
+            if !out_stats.is_null() {
+                let stats = std::slice::from_raw_parts_mut(out_stats, 3);
+                stats[0] = res.score;
+                stats[1] = res.dps;
+                stats[2] = res.ehp;
+            }
+            let cap = cap.max(0) as usize;
+            if !out_ids.is_null() && cap > 0 {
+                let n = res.ids.len().min(cap);
+                std::ptr::copy_nonoverlapping(res.ids.as_ptr(), out_ids, n);
+            }
+            res.ids.len() as c_int
+        }
+        Ok(Err(e)) => {
+            set_last_error(e);
+            -1
+        }
+        Err(_) => {
+            set_last_error("pob_opt_run_beam panicked");
+            -1
+        }
+    }
+}
+
 /// Copy the eligible candidate node ids (computed once at boot) into `out`,
 /// which the caller sizes to `cap` int32s. Returns the TOTAL candidate count
 /// (which may exceed `cap` — call once with cap=0/out=NULL to size, then again).

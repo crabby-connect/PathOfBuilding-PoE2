@@ -24,6 +24,8 @@ ffi.cdef[[
 	int  pob_opt_score_batch3(PobOptPool*, const int32_t* ids,
 	                          const int32_t* lengths, int32_t n, double* out);
 	int  pob_opt_candidate_ids(PobOptPool*, int32_t* out, int32_t cap);
+	int  pob_opt_run_beam(PobOptPool*, const char* params,
+	                      int32_t* out_ids, int32_t cap, double* out_stats);
 	int  pob_opt_worker_count(PobOptPool*);
 	void pob_opt_destroy(PobOptPool*);
 	const char* pob_opt_last_error(void);
@@ -169,6 +171,61 @@ function OptimizerPool:scoreBatch3(candidates)
 		out[i] = { score = outBuf[b], dps = outBuf[b + 1], ehp = outBuf[b + 2] }
 	end
 	return out
+end
+
+-- Run the FULL clean-slate beam + Pareto + elimination-diet search inside the
+-- pool and return the winning passive-tree allocation. This is the production
+-- search (src/beam.rs behind the pob_opt_run_beam FFI); the host kicks it off and
+-- reads back a result instead of orchestrating the loop on its single state.
+--
+-- The pool MUST have been created with candidateFn = "__pob_graph_export" and
+-- scoreFn = "__pob_score_cleanslate" (so it has tree topology and 3-axis scoring).
+--
+-- `params` is an optional table of beam tunables (any subset):
+--   capPoints, beamWidth, maxJump, paretoExtra, detour, patienceMax, maxRounds, verbose
+-- 0/absent keeps the Rust default (capPoints 0 => the build's real budget).
+--
+-- Returns a table { ids = { nodeId, ... }, score = n, dps = n, ehp = n }, or
+-- nil + error string on failure. `ids` includes the class start, sorted.
+function OptimizerPool:runBeam(params)
+	params = params or { }
+	-- Map the camelCase Lua keys to the snake_case key=value the cdylib parses.
+	local keyMap = {
+		capPoints = "cap_points", beamWidth = "beam_width", maxJump = "max_jump",
+		paretoExtra = "pareto_extra", detour = "detour", patienceMax = "patience_max",
+		maxRounds = "max_rounds", verbose = "verbose",
+	}
+	local lines = { }
+	for luaKey, cKey in pairs(keyMap) do
+		local v = params[luaKey]
+		if v ~= nil then
+			if type(v) == "boolean" then v = v and 1 or 0 end
+			lines[#lines + 1] = cKey .. "=" .. tostring(v)
+		end
+	end
+	local paramStr = table.concat(lines, "\n")
+
+	-- The winning set is at most (budget + 1) ids. We must size the output buffer
+	-- BEFORE the call without re-running the search just to count, so derive the
+	-- bound from capPoints if given, else the build's real budget the graph export
+	-- carries (flat[2] of the __pob_graph_export array, here index 3 in 1-based Lua).
+	local maxIds = params.capPoints and params.capPoints > 0 and (params.capPoints + 1) or nil
+	if not maxIds then
+		local flat = self:candidateIds()
+		local budget = flat[3] or 0
+		assert(budget > 0, "OptimizerPool:runBeam needs capPoints or a graph-export pool (got no budget)")
+		maxIds = budget + 1
+	end
+
+	local statsBuf = ffi.new("double[3]")
+	local idsBuf = ffi.new("int32_t[?]", maxIds)
+	local count = lib().pob_opt_run_beam(self.handle, paramStr, idsBuf, maxIds, statsBuf)
+	if count < 0 then
+		return nil, "OptimizerPool:runBeam failed: " .. lastError()
+	end
+	local ids = { }
+	for i = 0, math.min(count, maxIds) - 1 do ids[i + 1] = idsBuf[i] end
+	return { ids = ids, score = statsBuf[0], dps = statsBuf[1], ehp = statsBuf[2] }
 end
 
 -- Explicitly tear down the pool (joins all worker threads). Idempotent.

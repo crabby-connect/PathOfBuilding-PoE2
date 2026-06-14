@@ -43,6 +43,9 @@ src/Data/TimelessJewelData/*.bin
 # Simplegraphic Debugging
 runtime/imgui.ini
 
+# Tree-optimizer cdylib deployed by rust/deploy-optimizer.ps1 (build artifact)
+runtime/pob_optimizer.dll
+
 
 src/poe_api_response.json
 

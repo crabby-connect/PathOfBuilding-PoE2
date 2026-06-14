@@ -21,9 +21,12 @@ publish = false
 [lib]
 name = "pob_optimizer"
 # cdylib: a C-callable shared library (pob_optimizer.dll) loaded by the host
-# LuaJIT via ffi.load. No Rust ABI is exposed; the surface is the extern "C" fns
-# in src/ffi.rs.
-crate-type = ["cdylib"]
+# LuaJIT via ffi.load. The surface is the extern "C" fns in src/ffi.rs.
+# rlib: also build a Rust library so in-crate unit tests (e.g. the beam search in
+# src/beam.rs) and integration tests can link the search code directly. Examples
+# still drive the SHIPPED cdylib via libloading (they test the C ABI), so they do
+# not depend on the rlib.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # Resolve LuaJIT symbols from the SHIPPED runtime/lua51.dll at runtime. Workers
