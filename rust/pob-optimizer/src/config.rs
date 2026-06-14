@@ -13,6 +13,8 @@
 //!   candidate_fn  name of the global candidate-id enumerator (optional; empty
 //!                 disables candidate enumeration)
 //!   workers       worker-thread count (optional; default = available cores)
+//!   w_dps/w_ehp   per-axis upside weights (optional; default 1.0 each)
+//!   penalty_k     quadratic regression-penalty strength (optional; default 5.0)
 //!
 //! Path values are used verbatim. They may contain '=' (Windows paths don't, but
 //! be safe): we split on the FIRST '=' only. Forward or back slashes both work;
@@ -29,10 +31,16 @@ pub struct Config {
     pub candidate_fn: String,
     pub workers: usize,
     /// Score weights injected into the worker (default 1.0 each): the worker's
-    /// normalized score is 100*(w_dps*dps/refDps + w_ehp*ehp/refEhp). Raising
-    /// w_dps relative to w_ehp pulls the search toward damage.
+    /// normalized score rewards each axis's gain ABOVE the original build and
+    /// penalizes any shortfall quadratically. Raising w_dps relative to w_ehp
+    /// pulls the search toward damage on the upside.
     pub w_dps: f64,
     pub w_ehp: f64,
+    /// Quadratic regression-penalty strength (default 5.0). A candidate that
+    /// drops an axis below the original build is penalized by `penalty_k *
+    /// shortfall^2`, so the penalty grows unboundedly as an axis collapses and
+    /// no finite gain on the other axis can buy it back. K=5 lenient, K=25 strict.
+    pub penalty_k: f64,
 }
 
 impl Config {
@@ -48,6 +56,7 @@ impl Config {
         let mut workers: Option<usize> = None;
         let mut w_dps: f64 = 1.0;
         let mut w_ehp: f64 = 1.0;
+        let mut penalty_k: f64 = 5.0;
 
         for (lineno, raw) in s.lines().enumerate() {
             let line = raw.trim();
@@ -84,6 +93,11 @@ impl Config {
                         .parse()
                         .map_err(|_| format!("config: w_ehp='{val}' is not a number"))?;
                 }
+                "penalty_k" => {
+                    penalty_k = val
+                        .parse()
+                        .map_err(|_| format!("config: penalty_k='{val}' is not a number"))?;
+                }
                 other => return Err(format!("config: unknown key '{other}'")),
             }
         }
@@ -111,6 +125,7 @@ impl Config {
             workers,
             w_dps,
             w_ehp,
+            penalty_k,
         })
     }
 
@@ -127,6 +142,7 @@ impl Config {
             .replace("@@BUILD_XML@@", &fwd(&self.build_xml))
             // Score weights as Lua number literals (e.g. "3" or "1.5").
             .replace("@@W_DPS@@", &format!("{}", self.w_dps))
-            .replace("@@W_EHP@@", &format!("{}", self.w_ehp)))
+            .replace("@@W_EHP@@", &format!("{}", self.w_ehp))
+            .replace("@@PENALTY_K@@", &format!("{}", self.penalty_k)))
     }
 }

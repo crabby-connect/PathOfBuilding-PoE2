@@ -85,6 +85,9 @@ end
 -- Raising W_DPS relative to W_EHP pulls the search toward damage.
 local W_DPS = tonumber("@@W_DPS@@") or 1.0
 local W_EHP = tonumber("@@W_EHP@@") or 1.0
+-- Quadratic regression-penalty strength (config key penalty_k). Used only by the
+-- Rust beam (exported via __pob_graph_export), NOT by the per-candidate scorer.
+local PENALTY_K = tonumber("@@PENALTY_K@@") or 5.0
 local function scoreOf(out)
 	local dps = out.FullDPS or out.TotalDPS or 0
 	local ehp = out.TotalEHP or 0
@@ -120,11 +123,18 @@ for id, node in pairs(spec.allocNodes or {}) do
 	end
 end
 
--- Normalized score, identical to the spike's scoreOf: 100 * (W_DPS*dps/refDps + W_EHP*ehp/refEhp)
--- so DPS (hundreds) and EHP (thousands) are on the same scale. refs = the live build's values.
+-- SMOOTH GROWTH score: 100*(W_DPS*dps/refDps + W_EHP*ehp/refEhp), monotonic in
+-- both axes so the beam can climb from the start-only tree (every added node that
+-- raises dps or ehp raises the score). refs = the ORIGINAL build's values
+-- (calcBase = the build as currently allocated, no overrides). This is the GROWTH
+-- signal ONLY; the DPS/EHP regression penalty vs. the original is applied by the
+-- Rust beam to FULL-BUDGET trees (see beam.rs penalized_score) — it must NOT live
+-- here, because every partial tree is below the full original on both axes and a
+-- penalty/reject here would stall growth at 0 points.
 local refDps = math.max(calcBase.FullDPS or calcBase.TotalDPS or 0, 1)
 local refEhp = math.max(calcBase.TotalEHP or 0, 1)
--- Returns (normalized score, dps, ehp): the host's Pareto beam needs all three.
+-- Returns (growthScore, dps, ehp): the beam needs dps/ehp both to grow and to
+-- compute the final penalty. Always finite (no NaN gate) so the beam never stalls.
 local function scoreNorm(out)
 	local dps = out.FullDPS or out.TotalDPS or 0
 	local ehp = out.TotalEHP or 0
@@ -221,6 +231,18 @@ function __pob_graph_export()
 		if inSet[id] and id ~= startId then emitNode(id, node); n = n + 1 end
 	end
 	flat[3] = n
+	-- TRAILER (appended after the node data; backward-compatible — older parsers
+	-- read exactly `n` nodes and stop): the constants the Rust beam needs to apply
+	-- the DPS/EHP regression penalty to FULL-BUDGET trees. refDps/refEhp are the
+	-- ORIGINAL build's values (the floor to protect); W_DPS/W_EHP/PENALTY_K mirror
+	-- the score weights. Sent as ints (×1000 to keep a few decimals of the small
+	-- weight/K values; refs are large so truncation is negligible). Order:
+	--   [ refDps*1000, refEhp*1000, W_DPS*1000, W_EHP*1000, PENALTY_K*1000 ]
+	flat[#flat+1] = math.floor(refDps * 1000 + 0.5)
+	flat[#flat+1] = math.floor(refEhp * 1000 + 0.5)
+	flat[#flat+1] = math.floor(W_DPS * 1000 + 0.5)
+	flat[#flat+1] = math.floor(W_EHP * 1000 + 0.5)
+	flat[#flat+1] = math.floor(PENALTY_K * 1000 + 0.5)
 	return flat
 end
 

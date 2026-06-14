@@ -22,10 +22,10 @@
 //! Run from repo root (PATH must include runtime/ for transitive DLLs):
 //!   $env:PATH = "$PWD\runtime;$env:PATH"
 //!   cargo run --release --manifest-path rust/pob-optimizer/Cargo.toml \
-//!       --example beam_ab -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp]
+//!       --example beam_ab -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp] [penaltyK]
 //!
 //! Defaults: workers = available, capPoints = 0 (build's real budget), beamWidth = 8,
-//! outFile = mymonk_optimized.xml, wDps = 1, wEhp = 1.
+//! outFile = mymonk_optimized.xml, wDps = 1, wEhp = 1, penaltyK = 5 (lenient).
 
 use libloading::{Library, Symbol};
 use std::collections::HashSet;
@@ -65,9 +65,11 @@ fn main() {
     let beam_width: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
     // outFile arg (optional): the saved-build filename under src/Builds/.
     let out_file: String = args.next().unwrap_or_else(|| "mymonk_optimized.xml".to_string());
-    // wDps / wEhp args (optional): score weights. Default 1/1. Raise wDps to bias toward damage.
+    // wDps / wEhp args (optional): upside weights. Default 1/1. Raise wDps to bias toward damage.
     let w_dps: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
     let w_ehp: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    // penaltyK arg (optional): quadratic regression-penalty strength. Default 5 (lenient).
+    let penalty_k: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(5.0);
 
     let root = locate_repo_root().expect("locate repo root (need src/ + runtime/)");
     let fwd = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
@@ -78,7 +80,7 @@ fn main() {
     // pool hands back the flat graph the beam needs; score_fn => the clean-slate 3-return path.
     let make_config = |n_workers: usize| {
         format!(
-            "lua_dll={}\nsrc_dir={}\nruntime_dir={}\nruntime_lua={}\nbuild_xml={}\nbootstrap={}\nscore_fn=__pob_score_cleanslate\ncandidate_fn=__pob_graph_export\nworkers={}\nw_dps={}\nw_ehp={}\n",
+            "lua_dll={}\nsrc_dir={}\nruntime_dir={}\nruntime_lua={}\nbuild_xml={}\nbootstrap={}\nscore_fn=__pob_score_cleanslate\ncandidate_fn=__pob_graph_export\nworkers={}\nw_dps={}\nw_ehp={}\npenalty_k={}\n",
             fwd(root.join("runtime/lua51.dll")),
             fwd(root.join("src")),
             fwd(root.join("runtime")),
@@ -88,6 +90,7 @@ fn main() {
             n_workers,
             w_dps,
             w_ehp,
+            penalty_k,
         )
     };
 
@@ -112,7 +115,7 @@ fn main() {
         };
 
         // ---- boot the parallel pool -------------------------------------------------
-        println!("weights: w_dps={w_dps}, w_ehp={w_ehp}   output: {out_file}");
+        println!("weights: w_dps={w_dps}, w_ehp={w_ehp}, penalty_k={penalty_k}   output: {out_file}");
         println!("booting parallel pool (workers={}) ...", if workers == 0 { "auto".into() } else { workers.to_string() });
         let t_boot = Instant::now();
         let cfg = CString::new(make_config(workers)).unwrap();
@@ -203,7 +206,13 @@ fn main() {
             stats[0], stats[1], stats[2], win_ids.len() - 1, beam_dt
         );
         assert!(win_ids.len() > 1, "beam allocated nothing");
-        assert!(stats[0].is_finite() && stats[0] > 0.0, "beam best score not positive");
+        // With the quadratic-shortfall score the best can legitimately be <= 0 if
+        // nothing at this budget beats the original build on either axis without
+        // regressing the other; only a non-finite best is a real failure.
+        assert!(stats[0].is_finite(), "beam best score not finite");
+        if stats[0] <= 0.0 {
+            println!("  NOTE: best score {:.1} <= 0 — no tree improved an axis without regressing the other at this budget.", stats[0]);
+        }
 
         // ---- SAVE the optimized tree (mutates a worker spec, so it is the LAST pool call). ----
         let out_path = root.join("src/Builds").join(&out_file);

@@ -31,6 +31,16 @@ pub struct Graph {
     pub budget: usize,
     pub links: HashMap<i32, Vec<i32>>,
     pub ty: HashMap<i32, i32>,
+    /// Penalty constants the worker appends after the node data (see `parse`):
+    /// the ORIGINAL build's dps/ehp (the floor to protect) and the score weights /
+    /// quadratic-penalty strength. Used by `penalized_score` to dock full-budget
+    /// trees that regress an axis below the original. Defaults if the trailer is
+    /// absent (older export): refs=1.0 (=> no meaningful floor), weights=1, k=0.
+    pub ref_dps: f64,
+    pub ref_ehp: f64,
+    pub w_dps: f64,
+    pub w_ehp: f64,
+    pub penalty_k: f64,
 }
 
 impl Graph {
@@ -56,7 +66,43 @@ impl Graph {
             links.insert(id, adj);
             ty.insert(id, tc);
         }
-        Graph { start, budget, links, ty }
+        // TRAILER (optional, appended after the node data): 5 ints, each ×1000:
+        //   [ refDps, refEhp, w_dps, w_ehp, penalty_k ]. Absent on older exports —
+        //   fall back to refs=1.0 (no floor), weights=1, k=0 (penalty disabled).
+        let (ref_dps, ref_ehp, w_dps, w_ehp, penalty_k) = if flat.len() >= p + 5 {
+            (
+                (flat[p] as f64 / 1000.0).max(1.0),
+                (flat[p + 1] as f64 / 1000.0).max(1.0),
+                flat[p + 2] as f64 / 1000.0,
+                flat[p + 3] as f64 / 1000.0,
+                flat[p + 4] as f64 / 1000.0,
+            )
+        } else {
+            (1.0, 1.0, 1.0, 1.0, 0.0)
+        };
+        Graph { start, budget, links, ty, ref_dps, ref_ehp, w_dps, w_ehp, penalty_k }
+    }
+
+    /// Final-tree score with the DPS/EHP regression penalty. `growth` is the
+    /// worker's smooth absolute score (used to GROW the beam); this re-derives a
+    /// comparable score for FULL-BUDGET trees that rewards each axis's gain above
+    /// the original build and docks any shortfall quadratically (so no finite gain
+    /// on one axis buys back a collapse on the other). With `penalty_k == 0` (no
+    /// trailer) it reduces to the smooth growth score, preserving old behavior.
+    pub fn penalized_score(&self, growth: f64, dps: f64, ehp: f64) -> f64 {
+        if self.penalty_k <= 0.0 {
+            return growth;
+        }
+        let d_dps = dps / self.ref_dps - 1.0;
+        let d_ehp = ehp / self.ref_ehp - 1.0;
+        let term = |d: f64, w: f64| {
+            if d >= 0.0 {
+                w * d
+            } else {
+                -self.penalty_k * d * d
+            }
+        };
+        100.0 * (term(d_dps, self.w_dps) + term(d_ehp, self.w_ehp))
     }
 
     pub fn is_target(&self, id: i32) -> bool {
@@ -174,14 +220,23 @@ pub fn optimize(
         ($($a:tt)*) => { if params.verbose { println!($($a)*); } };
     }
 
+    // The beam GROWS on the worker's smooth absolute score (monotonic in both axes,
+    // so a partial tree below the original build still has a meaningful gradient to
+    // climb). The DIET, which compares FULL-BUDGET trees, judges them by the
+    // penalized score instead — that's where the DPS/EHP regression floor lives. A
+    // tree that wins on smooth score by gutting DPS for EHP loses on penalized
+    // score, so the diet bans the offending nodes. (penalty_k==0 => identity.)
+    let repenalize = |st: &mut State| { st.score = graph.penalized_score(st.score, st.dps, st.ehp); };
+
     // Round 0: unconstrained.
     log!("ROUND 0 (unconstrained)");
     let mut best = run_beam(
         graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
         &HashSet::new(), params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
     );
+    repenalize(&mut best);
     log!(
-        "  round 0 best: score={:.1} dps={:.1} ehp={:.1} pts={}",
+        "  round 0 best: penalized score={:.1} dps={:.1} ehp={:.1} pts={}",
         best.score, best.dps, best.ehp, best.ids.len() - 1
     );
 
@@ -212,10 +267,11 @@ pub fn optimize(
         let mut trial = banned.clone();
         trial.insert(victim.id);
         log!("  round {round}: ban {} (marginal {:+.1})", victim.id, victim.marginal);
-        let r = run_beam(
+        let mut r = run_beam(
             graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
             &trial, params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
         );
+        repenalize(&mut r);
         if r.score > best.score + 1e-6 {
             log!(
                 "    IMPROVED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping ban.",
@@ -349,7 +405,25 @@ fn run_beam(
                 let sc = memo[&ids];
                 State { ids, set, score: sc[0], dps: sc[1], ehp: sc[2] }
             })
+            // A NaN score is the scorer's REJECT signal (e.g. the quadratic-shortfall
+            // model rejects a candidate that regresses BOTH axes vs. the original
+            // build; the calc engine also returns NaN on failure). Drop rejects so
+            // they never enter the beam — and so the sort below never compares NaN
+            // (partial_cmp -> None -> unwrap panic).
+            .filter(|st| st.score.is_finite())
             .collect();
+        // If every extension this step was rejected, keep the current beam rather
+        // than panicking on an empty `next` (beam[0] is read below and downstream).
+        if next.is_empty() {
+            if verbose && (step % 5 == 0 || step == cap_points) {
+                let b = &beam[0];
+                println!(
+                    "  step {step:2}: best score={:.1} (pts={}, dps={:.1}, ehp={:.1})  [{} evals]  (no valid extension)",
+                    b.score, b.ids.len() - 1, b.dps, b.ehp, *total_evals
+                );
+            }
+            continue;
+        }
         next.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         beam = select_beam(next, beam_width, pareto_extra);
 
@@ -410,9 +484,22 @@ fn analyze_marginals(
     let mut marg = Vec::with_capacity(nodes.len());
     for (i, &id) in nodes.iter().enumerate() {
         let loo = memo[&loo_sets[i]];
-        let is_enabler = (best.dps > 0.0 && loo[1] < COLLAPSE * best.dps)
+        // Marginal = how much penalized score this node contributes (best vs. the
+        // tree without it). `best.score` is ALREADY penalized (optimize re-scores
+        // it); penalize the leave-one-out raw growth score the same way so both
+        // sides are on the same scale. The diet bans the lowest-marginal node, so a
+        // node that only adds EHP at the cost of the DPS floor scores LOW here and
+        // gets dieted out first — exactly the DPS protection we want.
+        let loo_pen = g.penalized_score(loo[0], loo[1], loo[2]);
+        let marginal = if loo_pen.is_finite() {
+            best.score - loo_pen
+        } else {
+            f64::INFINITY
+        };
+        let is_enabler = !loo_pen.is_finite()
+            || (best.dps > 0.0 && loo[1] < COLLAPSE * best.dps)
             || (best.ehp > 0.0 && loo[2] < COLLAPSE * best.ehp);
-        marg.push(Marginal { id, marginal: best.score - loo[0], is_enabler });
+        marg.push(Marginal { id, marginal, is_enabler });
     }
     marg
 }
@@ -550,7 +637,19 @@ mod tests {
         links.insert(1, vec![0, 2]);
         links.insert(2, vec![1, 3]);
         links.insert(3, vec![2]);
-        Graph { start: 0, budget: 3, links, ty }
+        // penalty_k=0 => penalized_score is identity, so the node-count fake score
+        // below is compared directly (no regression floor in this plumbing test).
+        Graph {
+            start: 0,
+            budget: 3,
+            links,
+            ty,
+            ref_dps: 1.0,
+            ref_ehp: 1.0,
+            w_dps: 1.0,
+            w_ehp: 1.0,
+            penalty_k: 0.0,
+        }
     }
 
     #[test]
@@ -585,5 +684,27 @@ mod tests {
         assert_eq!(res.ids, vec![0, 1, 2, 3]);
         assert_eq!(res.score, 4.0);
         assert!(res.evals > 0);
+    }
+
+    #[test]
+    fn penalized_score_blocks_axis_collapse() {
+        // ref = original build's dps/ehp; w=1/1; K=10. The growth arg is ignored
+        // when penalty_k>0, so pass 0.0.
+        let g = Graph {
+            start: 0, budget: 0, links: HashMap::new(), ty: HashMap::new(),
+            ref_dps: 100.0, ref_ehp: 1000.0, w_dps: 1.0, w_ehp: 1.0, penalty_k: 10.0,
+        };
+        // Pure improvement on both axes: positive.
+        assert!(g.penalized_score(0.0, 110.0, 1080.0) > 0.0);
+        // The motivating bad trade: -13% dps for +3.5% ehp. Quadratic penalty on
+        // the dps drop dominates the small ehp gain => negative (rejected by diet).
+        assert!(g.penalized_score(0.0, 87.0, 1035.0) < 0.0);
+        // The hole in a LINEAR penalty: -50% dps but +250% ehp. A linear sum would
+        // net positive; the quadratic dps penalty (10*0.5^2=2.5) cancels the +2.5
+        // ehp gain => <= 0. No finite ehp blow-up rescues a collapsed dps axis.
+        assert!(g.penalized_score(0.0, 50.0, 3500.0) <= 0.0);
+        // penalty_k=0 => identity (old behavior): returns the growth arg verbatim.
+        let g0 = Graph { penalty_k: 0.0, ..g };
+        assert_eq!(g0.penalized_score(42.0, 1.0, 1.0), 42.0);
     }
 }

@@ -1,6 +1,7 @@
 # Rust Tree-Optimizer Integration (production cdylib)
 
-**Status:** integrated (2026-06-12); search loop promoted into the crate (2026-06-14).
+**Status:** integrated (2026-06-12); search loop promoted into the crate (2026-06-14);
+growth/penalty score split protecting the DPS/EHP floor (2026-06-14).
 Code in `rust/pob-optimizer/`.
 **Builds on:** `docs/rust-offload-poc.md` (the PoC that proved the worker model)
 and `docs/tree-optimizer-design.md` (the search this feeds).
@@ -26,8 +27,8 @@ the search *loop*; the per-candidate scoring is still canonical Lua in the worke
 | `rust/pob-optimizer/src/ffi.rs` | the `extern "C"` boundary (the only public surface) |
 | `rust/pob-optimizer/src/pool.rs` | persistent worker pool (N threads, one LuaJIT state each, booted once and reused) |
 | `rust/pob-optimizer/src/lua.rs` | minimal LuaJIT C-API binding, resolved from the shipped `runtime/lua51.dll` |
-| `rust/pob-optimizer/src/config.rs` | parses the `key=value` config string from the host (incl. `w_dps`/`w_ehp` weights) |
-| `rust/pob-optimizer/src/beam.rs` | the production search: beam + Pareto + elimination diet (graph parse, `optimize()`) |
+| `rust/pob-optimizer/src/config.rs` | parses the `key=value` config string from the host (incl. `w_dps`/`w_ehp` weights, `penalty_k`) |
+| `rust/pob-optimizer/src/beam.rs` | the production search: beam + Pareto + elimination diet (graph parse, `optimize()`, `penalized_score()`) |
 | `rust/pob-optimizer/worker_bootstrap.lua` | per-worker boot: engine + build + the score/candidate/graph-export/save fns |
 | `rust/pob-optimizer/examples/smoke.rs` | end-to-end test, calling the C ABI exactly as Lua does |
 | `rust/pob-optimizer/examples/beam_ab.rs` | native A/B harness: microbench (par vs 1-worker) + full search via `pob_opt_run_beam` + save |
@@ -73,12 +74,14 @@ The **beam A/B harness** drives the full production search through the shipped D
 
 ```
 cargo run --release --manifest-path rust/pob-optimizer/Cargo.toml \
-    --example beam_ab -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp]
+    --example beam_ab -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp] [penaltyK]
 ```
 
 `capPoints=0` (default) uses the build's real budget; a small cap (e.g. 12) is a
-quick end-to-end check. The crate also has `cargo test --lib` unit tests for the
-beam (param parsing + a synthetic-graph growth test, no engine needed).
+quick end-to-end check. `penaltyK` (default 5) tunes the regression penalty (see
+"Scoring: growth vs. penalty"). The crate also has `cargo test --lib` unit tests for
+the beam (param parsing, a synthetic-graph growth test, and the penalized-score
+axis-collapse guard — no engine needed).
 
 ## FFI contract
 
@@ -101,14 +104,19 @@ const char* pob_opt_last_error(void);                            // thread-local
 - **`config`** is newline-delimited `key=value` (NOT JSON, to keep the cdylib
   dependency-free). Keys: `lua_dll`, `src_dir`, `runtime_dir`, `runtime_lua`,
   `build_xml`, `bootstrap`, `score_fn`, `candidate_fn` (optional), `workers`
-  (optional; 0 = available cores), `w_dps` / `w_ehp` (optional score weights,
-  default 1.0 each — injected into the worker bootstrap). See `config.rs`.
+  (optional; 0 = available cores), `w_dps` / `w_ehp` (optional upside weights,
+  default 1.0 each), `penalty_k` (optional quadratic regression-penalty strength,
+  default 5.0). All four are injected into the worker bootstrap and exported back
+  to the beam via the graph trailer (see "Scoring: growth vs. penalty"). See
+  `config.rs`.
 - **`score_batch`** flattens candidates: `ids` is every node id concatenated,
   `lengths[k]` is candidate k's id count. Writes `n` doubles to `out` in order;
   a candidate that fails to score gets `NaN` (the search treats NaN as reject).
 - **`score_batch3`** is `score_batch` but writes **three** doubles per candidate —
-  `(score, dps, ehp)` interleaved (so `out` holds `3*n`). Drives the clean-slate
-  score fn; the beam needs dps/ehp for Pareto pruning. NaN triple on failure.
+  `(growthScore, dps, ehp)` interleaved (so `out` holds `3*n`). Drives the
+  clean-slate score fn; `growthScore` is the smooth absolute score the beam grows
+  on, and the beam re-derives a penalized final score from `dps`/`ehp` (see
+  "Scoring: growth vs. penalty"). NaN triple on failure.
 - **`run_beam`** runs the WHOLE search (`src/beam.rs::optimize`) inside the pool
   and writes the winning node-id set (incl. class start, sorted) to `out_ids`,
   returning the total count. The pool must be created with
@@ -141,16 +149,53 @@ The worker exposes several globals the FFI dispatches to:
   candidate node-id set (incl. class start + travel nodes); it is scored ABSOLUTELY
   via the clean-slate override (`addNodes = candidate`, `removeNodes = current
   alloc − start`), reproducing the spike's numbers. Returns **three** values
-  `(normScore, dps, ehp)` where `normScore = 100·(W_DPS·dps/refDps + W_EHP·ehp/refEhp)`
-  (refs = the live build's values, so DPS and EHP are on the same scale).
+  `(growthScore, dps, ehp)` where `growthScore = 100·(W_DPS·dps/refDps +
+  W_EHP·ehp/refEhp)` (refs = the original build's values, so DPS and EHP are on the
+  same scale). This is the **growth signal** — smooth and monotonic in both axes so
+  the beam can climb from the start-only tree. It is NOT the final objective; the
+  beam applies the regression penalty (see below). Always finite (no NaN gate),
+  because a per-candidate reject would stall growth (every partial tree is below the
+  full original build on both axes).
 - **`__pob_graph_export()`** — returns the flat tree topology + budget the Rust
-  beam needs: `[ startId, budgetP, nNodes, (id, typeCode, nLinks, link...)·nNodes ]`
-  (typeCode 0=other/1=Normal/2=Notable/3=Keystone). Main-tree, non-ascendancy,
-  non-mastery nodes only. Wired in as `candidate_fn` for the beam.
+  beam needs, plus a trailer of penalty constants:
+  `[ startId, budgetP, nNodes, (id, typeCode, nLinks, link...)·nNodes,
+  refDps·1000, refEhp·1000, W_DPS·1000, W_EHP·1000, PENALTY_K·1000 ]`
+  (typeCode 0=other/1=Normal/2=Notable/3=Keystone; trailer ints are ×1000 to keep
+  a few decimals). Main-tree, non-ascendancy, non-mastery nodes only. The trailer is
+  appended AFTER the node data, so older parsers that read exactly `nNodes` nodes
+  ignore it (backward-compatible; missing trailer ⇒ penalty disabled). Wired in as
+  `candidate_fn` for the beam.
 - **`__pob_save_optimized(packed)`** — applies the winner to the live spec
   (keeping the build's ascendancy) and `build:SaveDB`s it to the packed path.
-- Score weights `W_DPS`/`W_EHP` are injected by Rust from the config (`w_dps`/
-  `w_ehp`), defaulting to 1/1.
+- Score weights `W_DPS`/`W_EHP` and the penalty strength `PENALTY_K` are injected by
+  Rust from the config (`w_dps`/`w_ehp`/`penalty_k`), defaulting to 1/1/5.
+
+### Scoring: growth vs. penalty
+
+The objective is split across the worker/beam boundary to reconcile two conflicting
+needs — a smooth gradient to **grow** the tree, and a DPS/EHP floor to **select** the
+final tree:
+
+- **Growth** (worker, `__pob_score_cleanslate`): the smooth absolute score
+  `100·(W_DPS·dps/refDps + W_EHP·ehp/refEhp)`, monotonic in both axes, drives beam
+  expansion. Every node that raises dps or ehp raises the score, so the beam always
+  has a gradient — even for partial trees that are below the original build.
+- **Selection** (beam, `Graph::penalized_score` in `src/beam.rs`): the elimination
+  diet only ever compares **full-budget** trees, and judges them by a penalized
+  score — each axis's gain ABOVE the original build counts linearly, any shortfall
+  BELOW it is docked **quadratically and uncapped** (`−K·delta²` per axis). The
+  quadratic, uncapped penalty means no finite gain on one axis can buy back a
+  collapse on the other (the hole in a linear sum: `−50% dps / +250% ehp` used to net
+  positive — now the `K·0.5²` term dominates). `PENALTY_K = 0` (no trailer) reduces
+  it to the smooth growth score, preserving old behavior. Raising `W_DPS` relative to
+  `W_EHP` biases the upside toward damage; raising `K` makes regressions less
+  forgiving (5 lenient, 25 strict). Unit-tested in `penalized_score_blocks_axis_collapse`.
+
+**Why the penalty must NOT live in the worker:** an earlier design rejected (NaN'd)
+any candidate that regressed both axes vs. the original. Because the beam grows from
+0 nodes and every partial tree is below the full original build on both axes, that
+rejected every step and the beam never grew past 0 points. The growth/penalty split
+above is the fix.
 
 ## Known limits (carried from the PoC)
 
@@ -173,3 +218,8 @@ The worker exposes several globals the FFI dispatches to:
 clean-slate scorer, config `w_dps`/`w_ehp` weights, `__pob_graph_export`, the
 in-crate beam search (`src/beam.rs` + `pob_opt_run_beam`), `__pob_save_optimized` +
 `call_save`, the `beam_ab` harness, `OptimizerPool:runBeam`, and the deploy script.
+The **growth/penalty score split** (2026-06-14): `Graph::penalized_score` with a
+quadratic, uncapped regression floor vs. the original build (config `penalty_k`,
+exported via the graph trailer), so the diet stops trading away DPS for EHP; plus
+NaN-safe beam selection/marginals. Validated on mymonk at 127 pts: DPS 784→1217
+(+35% vs. the old linear 1/1 result) while EHP held.
