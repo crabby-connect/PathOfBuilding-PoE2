@@ -45,3 +45,11 @@ runtime/imgui.ini
 
 
 src/poe_api_response.json
+
+# Tree-optimizer scratch artifacts (beam run logs, poe.ninja scrape responses,
+# scoreboards) and the local Claude memory store — throwaway, never checked in.
+beam_*.log
+spike_*.log
+*.network-response
+poe_ninja_*.json
+memory/

@@ -36,7 +36,14 @@
 --     ghcr.io/pathofbuildingcommunity/pathofbuilding-tests:latest `
 --     busted --lua=luajit --filter CleanSlate
 --
+-- Budget P is AUTO-DETECTED from the loaded character: available = (level-1) + questPoints +
+-- extra (PoB's own relation, Build.lua:1011). So importing a higher-level build (e.g. ding
+-- 74 -> 87) is picked up automatically and the optimizer may spend points the current tree
+-- hasn't allocated. Override with SPIKE_POINTS; falls back to the tree's current usage if the
+-- auto-detected budget reads <= 0.
+--
 -- Tunables via env:
+--   SPIKE_POINTS (override the auto-detected point budget)
 --   SPIKE_BEAM (beam width, default 20)      SPIKE_MAXJUMP (max path-jump length, default 8)
 --   SPIKE_MAXDEPTH (cap P for a quick run)   SPIKE_WDPS / SPIKE_WEHP (axis weights, default 1)
 --   SPIKE_DETOUR (excluded-node traversal penalty, default 50)
@@ -70,8 +77,31 @@ describe("CleanSlate: beam reallocation", function()
 		local maxDepthCap = tonumber(os.getenv("SPIKE_MAXDEPTH")) or 0
 
 		-- ---- Budget P and the current tree's baseline score ------------------------------
-		local P = (spec:CountAllocNodes()) -- normal passive points used by the current build
-		assert.is_true(P and P > 0, "build has no allocated normal passives - load a real build via SPIKE_BUILD_XML")
+		-- AUTO-DETECT the point budget from the loaded character's LEVEL + quest points, not
+		-- from how many points the imported tree happens to spend. PoB's own relation
+		-- (Build.lua:1011, inverted) is:  available = (level - 1) + questPoints(lastAct) + extra.
+		-- `build.characterLevel` is set from the build XML on load (Build.lua:1116) and
+		-- `build.acts[build.maxActs].questPoints` is the cumulative quest passive total. Using
+		-- the AVAILABLE budget means a level-up (e.g. 74 -> 87) is picked up automatically and
+		-- the optimizer is free to spend points the current tree hasn't allocated yet.
+		local usedNow = spec:CountAllocNodes() -- normal passives the current tree actually spends
+		local charLevel = build.characterLevel or 1
+		local questPoints = (build.acts and build.maxActs and build.acts[build.maxActs]
+			and build.acts[build.maxActs].questPoints) or 0
+		local extraPoints = (build.calcsTab and build.calcsTab.mainOutput and build.calcsTab.mainOutput.ExtraPoints) or 0
+		local availP = (charLevel - 1) + questPoints + extraPoints
+		-- Budget = how many points the CURRENT tree spends (usedNow). The optimizer reallocates
+		-- the SAME number of points the build already commits, so the result is a same-size tree
+		-- it can drop straight in. We also compute the level-legal `availP` (level + quest + extra)
+		-- purely for reporting — if usedNow > availP the imported tree is over a legal budget for
+		-- its level (extra point sources, a stale source build, or leveling headroom). Override the
+		-- whole thing with SPIKE_POINTS. Guard against a bogus 0 by falling back to availP.
+		local P = tonumber(os.getenv("SPIKE_POINTS")) or usedNow
+		if not (P and P > 0) then P = availP end
+		assert.is_true(P and P > 0, "build has no point budget - load a real build via SPIKE_BUILD_XML")
+		print(string.format("Auto-detected budget: current tree spends %d points (level %d => %d legal: %d level + %d quest + %d extra)%s",
+			usedNow, charLevel, availP, charLevel - 1, questPoints, extraPoints,
+			usedNow > availP and string.format("  [NOTE: tree is %d over a legal level-%d budget]", usedNow - availP, charLevel) or ""))
 
 		-- Raw current-build numbers (calcBase = current tree). Used both as the comparison
 		-- target AND to NORMALIZE the score so DPS (hundreds) and EHP (thousands) are on the
@@ -94,7 +124,8 @@ describe("CleanSlate: beam reallocation", function()
 		local curScore, curDps, curEhp = scoreOf(calcBase) -- normalized current = ~100*(W_DPS+W_EHP)
 
 		local startId = spec.curClass.startNodeId
-		print(string.format("\nClass: %s   Budget P = %d normal points", spec.curClassName, P))
+		print(string.format("\nClass: %s   Budget P = %d normal points%s", spec.curClassName, P,
+			P > usedNow and string.format(" (current tree uses only %d; %d unspent points to invest)", usedNow, P - usedNow) or ""))
 		print(string.format("Current tree score=%.1f  dps=%.1f  ehp=%.1f", curScore, curDps, curEhp))
 
 		-- ---- ACCELERATED CALCULATOR (SPIKE_ACCEL) ----------------------------------------
@@ -775,7 +806,7 @@ describe("CleanSlate: beam reallocation", function()
 				#banNames > 0 and table.concat(banNames, ", ") or "none"))
 			print("  notables/keystones: " .. table.concat(names, ", "))
 		end
-		print(string.format("For reference - hand-made: score=%.1f dps=%.1f ehp=%.1f points=%d", curScore, curDps, curEhp, P))
+		print(string.format("For reference - hand-made: score=%.1f dps=%.1f ehp=%.1f points=%d (optimizer budget=%d)", curScore, curDps, curEhp, usedNow, P))
 
 		-- ---- per-round progress table ----------------------------------------------------
 		print("\n=== DIET PROGRESS ===")

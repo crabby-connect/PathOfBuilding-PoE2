@@ -145,6 +145,33 @@ impl<'a> Lua<'a> {
         self.pop_number(name)
     }
 
+    /// Call `name(ids_table)` expecting THREE numbers back: (score, dps, ehp).
+    /// Same arg-building as call_global_score; used by the clean-slate path, which
+    /// must carry dps/ehp so the host's Pareto beam can prune by both axes.
+    pub unsafe fn call_global_score3(&self, name: &str, ids: &[i32]) -> Result<[f64; 3], String> {
+        self.push_global(name)?;
+        (self.lib.create_table)(self.l, ids.len() as c_int, 0);
+        for (i, &id) in ids.iter().enumerate() {
+            (self.lib.push_number)(self.l, id as c_double);
+            (self.lib.raw_set_i)(self.l, -2, (i + 1) as c_int);
+        }
+        // nresults = 3: Lua pads with nil if the fn returns fewer; we validate types.
+        if (self.lib.pcall)(self.l, 1, 3, 0) != LUA_OK {
+            return Err(self.pop_error(name));
+        }
+        // Stack (bottom->top): score(-3), dps(-2), ehp(-1). Read before popping.
+        let mut out = [0.0f64; 3];
+        for (slot, idx) in [(0usize, -3i32), (1, -2), (2, -1)] {
+            if (self.lib.ty)(self.l, idx) != LUA_TNUMBER {
+                (self.lib.set_top)(self.l, 0);
+                return Err(format!("{name}: result {} is not a number", slot + 1));
+            }
+            out[slot] = (self.lib.to_number)(self.l, idx);
+        }
+        (self.lib.set_top)(self.l, 0);
+        Ok(out)
+    }
+
     /// Call a zero-arg global function expected to return a Lua array of numbers
     /// (e.g. `__pob_candidate_ids`). Returns the values truncated to i32. Used
     /// once at setup, not on the hot path.

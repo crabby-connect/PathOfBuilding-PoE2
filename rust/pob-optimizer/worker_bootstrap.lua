@@ -80,10 +80,11 @@ local function addSetFor(ids)
 	return set
 end
 
--- Weighted scalar over REAL calc outputs. Weights come from the host via globals
--- the search can set before the run; default 1/1 (DPS + EHP), matching the spike.
-local W_DPS = tonumber(_G.__pob_w_dps) or 1.0
-local W_EHP = tonumber(_G.__pob_w_ehp) or 1.0
+-- Weighted scalar over REAL calc outputs. Weights are injected by Rust from the
+-- pool config (config.rs render_bootstrap, keys w_dps/w_ehp), defaulting to 1/1.
+-- Raising W_DPS relative to W_EHP pulls the search toward damage.
+local W_DPS = tonumber("@@W_DPS@@") or 1.0
+local W_EHP = tonumber("@@W_EHP@@") or 1.0
 local function scoreOf(out)
 	local dps = out.FullDPS or out.TotalDPS or 0
 	local ehp = out.TotalEHP or 0
@@ -98,6 +99,49 @@ function __pob_score(ids)
 	end
 	local out = calcFunc({ addNodes = addSetFor(ids) }, true)
 	return scoreOf(out)
+end
+
+-- ---- CLEAN-SLATE score path (mirrors SpikeCleanSlateBeam_spec.lua) ----------------
+-- The beam optimizer does NOT score "current tree + added nodes"; it scores an ABSOLUTE
+-- candidate P-node tree grown from the class start, via the clean-slate override:
+--     addNodes = candidateTree(full id set incl. start),  removeNodes = currentAlloc-start
+-- so the evaluated node set == the candidate exactly (CalcSetup.lua:718-749). To make the
+-- pool reproduce the spike's numbers (not the add-semantics above), __pob_score_cleanslate
+-- takes the FULL candidate id set, expands to node objects (NO node.path — the host already
+-- includes the travel nodes in the id set the same way the spike's beam does), and scores it
+-- with removeNodes pinned to the build's original allocation.
+local startId = spec.curClass and spec.curClass.startNodeId
+-- removeCurrent: everything currently allocated EXCEPT the class start and ascendancy nodes,
+-- built ONCE (the original build's allocation never changes during the search).
+local removeCurrent = {}
+for id, node in pairs(spec.allocNodes or {}) do
+	if id ~= startId and not node.ascendancyName then
+		removeCurrent[node] = true
+	end
+end
+
+-- Normalized score, identical to the spike's scoreOf: 100 * (W_DPS*dps/refDps + W_EHP*ehp/refEhp)
+-- so DPS (hundreds) and EHP (thousands) are on the same scale. refs = the live build's values.
+local refDps = math.max(calcBase.FullDPS or calcBase.TotalDPS or 0, 1)
+local refEhp = math.max(calcBase.TotalEHP or 0, 1)
+-- Returns (normalized score, dps, ehp): the host's Pareto beam needs all three.
+local function scoreNorm(out)
+	local dps = out.FullDPS or out.TotalDPS or 0
+	local ehp = out.TotalEHP or 0
+	return 100 * (W_DPS * dps / refDps + W_EHP * ehp / refEhp), dps, ehp
+end
+
+-- Clean-slate hot path. ids = full candidate node-id set (incl. class start + travel nodes).
+-- Empty ids => the start-only tree's score, which the beam uses as its from-scratch baseline.
+-- Returns three numbers (score, dps, ehp) consumed by call_global_score3.
+function __pob_score_cleanslate(ids)
+	local addSet = {}
+	for i = 1, #ids do
+		local node = nodeById[ids[i]]
+		if node then addSet[node] = true end
+	end
+	local out = calcFunc({ addNodes = addSet, removeNodes = removeCurrent }, true)
+	return scoreNorm(out)
 end
 
 -- Eligibility mirrors PowerBuilder (src/Classes/CalcsTab.lua) and the spike:
@@ -121,6 +165,104 @@ function __pob_candidate_ids()
 		if isEligible(node) then ids[#ids + 1] = id end
 	end
 	return ids
+end
+
+-- ---- GRAPH EXPORT (for the native Rust beam harness) -----------------------------
+-- The beam search must run where the tree topology lives. The busted spike runs it in
+-- Lua; the native Rust harness (examples/beam_ab.rs) has no graph, so we export it once.
+-- Returns a FLAT array of integers the Rust side parses (call_global_int_array reads a
+-- numeric array). Layout:
+--   [ startId, budgetP, nNodes,
+--     repeated nNodes times: id, typeCode, nLinks, link1, link2, ... linkK ]
+-- budgetP = the normal passive points the CURRENT build spends (spec:CountAllocNodes),
+-- so the native harness can budget the beam to the real build instead of a guessed cap.
+-- typeCode: 0=other, 1=Normal, 2=Notable, 3=Keystone (matches the beam's targeting).
+-- Only MAIN-tree, non-ascendancy, non-mastery nodes are exported (the beam's universe);
+-- links are filtered to other exported nodes so the Rust adjacency is self-contained.
+local function typeCode(node)
+	local t = node.type
+	if t == "Keystone" then return 3
+	elseif t == "Notable" then return 2
+	elseif t == "Normal" then return 1
+	else return 0 end
+end
+local function exportable(node)
+	return node and node.id
+		and node.type ~= "ClassStart" and node.type ~= "AscendClassStart"
+		and not node.ascendancyName
+		and node.type ~= "Mastery"
+end
+function __pob_graph_export()
+	local budgetP = (spec.CountAllocNodes and spec:CountAllocNodes()) or 0
+	local flat = { startId or 0, budgetP, 0 }
+	-- mark exportable ids so we can filter links to within the exported set
+	local inSet = {}
+	for id, node in pairs(nodeById) do
+		if exportable(node) then inSet[id] = true end
+	end
+	-- the class start must be present as a node even if exportable() excludes it (it's a
+	-- ClassStart) so the beam has a root with its real adjacency.
+	local startNode = startId and nodeById[startId]
+	local function emitNode(id, node)
+		flat[#flat+1] = id
+		flat[#flat+1] = typeCode(node)
+		local links = {}
+		for _, other in ipairs(node.linked or {}) do
+			if other.id and (inSet[other.id] or other.id == startId) and other.id ~= id then
+				links[#links+1] = other.id
+			end
+		end
+		flat[#flat+1] = #links
+		for _, lid in ipairs(links) do flat[#flat+1] = lid end
+	end
+	local n = 0
+	if startNode then emitNode(startId, startNode); n = n + 1 end
+	for id, node in pairs(nodeById) do
+		if inSet[id] and id ~= startId then emitNode(id, node); n = n + 1 end
+	end
+	flat[3] = n
+	return flat
+end
+
+-- ---- SAVE the optimized tree to an importable PoB XML ----------------------------
+-- Mirrors SpikeCleanSlateBeam_spec.lua's save block: apply the winning main-tree id
+-- set to the live spec (keeping the build's existing ascendancy), then build:SaveDB so
+-- the file opens directly in PoB. This MUTATES the worker's spec, so the host must call
+-- it exactly once, on a dedicated throwaway query AFTER all scoring is done (any further
+-- __pob_score_cleanslate call on this worker would now be relative to the mutated spec).
+--
+-- Contract: the host packs [ n_ids, id1..idn, pathChars... ] into the id array, where the
+-- trailing chars after the ids are the BYTES of the output path (so we avoid a second FFI
+-- entry). __pob_save_optimized(packed) unpacks, saves, and returns 1.0 on success / 0.0 on
+-- failure (a number, so it flows back through call_global_score3's first return slot).
+function __pob_save_optimized(packed)
+	local n = packed[1] or 0
+	local hashList = {}
+	for i = 1, n do
+		local id = packed[1 + i]
+		local node = nodeById[id]
+		if node and not node.ascendancyName then table.insert(hashList, id) end
+	end
+	-- keep the build's existing ascendancy allocation (ascendancy is fixed, not searched)
+	for id, node in pairs(spec.allocNodes or {}) do
+		if node.ascendancyName then table.insert(hashList, id) end
+	end
+	-- decode the trailing path bytes
+	local pathBytes = {}
+	for i = 2 + n, #packed do pathBytes[#pathBytes+1] = string.char(packed[i]) end
+	local outPath = table.concat(pathBytes)
+	if outPath == "" then return 0.0 end
+
+	local ok = pcall(function()
+		spec:ImportFromNodeList(nil, spec.curClassId, spec.curAscendClassId,
+			spec.curSecondaryAscendClassId or 0, hashList, {}, {}, {})
+		spec:BuildAllDependsAndPaths()
+		local xmlText = build:SaveDB("optimized")
+		assert(xmlText, "SaveDB returned nil")
+		local f = assert(io.open(outPath, "w+"), "cannot open " .. outPath)
+		f:write(xmlText); f:close()
+	end)
+	return ok and 1.0 or 0.0
 end
 
 -- Optional sanity hooks the Rust side / tests can call.

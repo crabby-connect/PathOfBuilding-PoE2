@@ -28,6 +28,11 @@ pub struct Config {
     pub score_fn: String,
     pub candidate_fn: String,
     pub workers: usize,
+    /// Score weights injected into the worker (default 1.0 each): the worker's
+    /// normalized score is 100*(w_dps*dps/refDps + w_ehp*ehp/refEhp). Raising
+    /// w_dps relative to w_ehp pulls the search toward damage.
+    pub w_dps: f64,
+    pub w_ehp: f64,
 }
 
 impl Config {
@@ -41,6 +46,8 @@ impl Config {
         let mut score_fn = None;
         let mut candidate_fn: Option<String> = None;
         let mut workers: Option<usize> = None;
+        let mut w_dps: f64 = 1.0;
+        let mut w_ehp: f64 = 1.0;
 
         for (lineno, raw) in s.lines().enumerate() {
             let line = raw.trim();
@@ -67,6 +74,16 @@ impl Config {
                         .map_err(|_| format!("config: workers='{val}' is not a number"))?;
                     workers = Some(w);
                 }
+                "w_dps" => {
+                    w_dps = val
+                        .parse()
+                        .map_err(|_| format!("config: w_dps='{val}' is not a number"))?;
+                }
+                "w_ehp" => {
+                    w_ehp = val
+                        .parse()
+                        .map_err(|_| format!("config: w_ehp='{val}' is not a number"))?;
+                }
                 other => return Err(format!("config: unknown key '{other}'")),
             }
         }
@@ -92,6 +109,8 @@ impl Config {
             score_fn: req(score_fn, "score_fn")?,
             candidate_fn: candidate_fn.unwrap_or_default(),
             workers,
+            w_dps,
+            w_ehp,
         })
     }
 
@@ -105,6 +124,9 @@ impl Config {
         Ok(template
             .replace("@@RUNTIME_LUA@@", &fwd(&self.runtime_lua))
             .replace("@@RUNTIME@@", &fwd(&self.runtime_dir))
-            .replace("@@BUILD_XML@@", &fwd(&self.build_xml)))
+            .replace("@@BUILD_XML@@", &fwd(&self.build_xml))
+            // Score weights as Lua number literals (e.g. "3" or "1.5").
+            .replace("@@W_DPS@@", &format!("{}", self.w_dps))
+            .replace("@@W_EHP@@", &format!("{}", self.w_ehp)))
     }
 }

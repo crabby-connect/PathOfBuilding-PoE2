@@ -21,6 +21,8 @@ ffi.cdef[[
 	PobOptPool* pob_opt_create(const char* config);
 	int  pob_opt_score_batch(PobOptPool*, const int32_t* ids,
 	                         const int32_t* lengths, int32_t n, double* out);
+	int  pob_opt_score_batch3(PobOptPool*, const int32_t* ids,
+	                          const int32_t* lengths, int32_t n, double* out);
 	int  pob_opt_candidate_ids(PobOptPool*, int32_t* out, int32_t cap);
 	int  pob_opt_worker_count(PobOptPool*);
 	void pob_opt_destroy(PobOptPool*);
@@ -130,6 +132,43 @@ function OptimizerPool:scoreBatch(candidates)
 	local scores = { }
 	for i = 1, n do scores[i] = outBuf[i - 1] end
 	return scores
+end
+
+-- Score a batch of candidate node-id sets, returning (score, dps, ehp) per
+-- candidate. `candidates` is an array of arrays of integer node ids. Returns a
+-- parallel array of { score, dps, ehp } tables; NaN fields for any that failed.
+-- Drives the clean-slate worker fn (__pob_score_cleanslate), so the host's beam
+-- can prune by both axes (Pareto). Same flat (ids,lengths) layout as scoreBatch.
+function OptimizerPool:scoreBatch3(candidates)
+	local n = #candidates
+	if n == 0 then return { } end
+
+	local total = 0
+	for i = 1, n do total = total + #candidates[i] end
+	local idsBuf = ffi.new("int32_t[?]", math.max(total, 1))
+	local lenBuf = ffi.new("int32_t[?]", n)
+	local cursor = 0
+	for i = 1, n do
+		local c = candidates[i]
+		lenBuf[i - 1] = #c
+		for j = 1, #c do
+			idsBuf[cursor] = c[j]
+			cursor = cursor + 1
+		end
+	end
+
+	-- 3 doubles per candidate: (score, dps, ehp) interleaved.
+	local outBuf = ffi.new("double[?]", n * 3)
+	local rc = lib().pob_opt_score_batch3(self.handle, idsBuf, lenBuf, n, outBuf)
+	if rc ~= 0 then
+		error("OptimizerPool:scoreBatch3 failed (rc=" .. rc .. "): " .. lastError())
+	end
+	local out = { }
+	for i = 1, n do
+		local b = (i - 1) * 3
+		out[i] = { score = outBuf[b], dps = outBuf[b + 1], ehp = outBuf[b + 2] }
+	end
+	return out
 end
 
 -- Explicitly tear down the pool (joins all worker threads). Idempotent.

@@ -173,6 +173,118 @@ pub unsafe extern "C" fn pob_opt_score_batch(
     }
 }
 
+/// Like `pob_opt_score_batch` but writes THREE doubles per candidate —
+/// (score, dps, ehp) interleaved — so `out` must hold `3*n` doubles. Drives the
+/// clean-slate score fn (the host's beam needs dps/ehp for Pareto pruning). A
+/// candidate that fails scores (NAN, NAN, NAN). Returns 0 on success.
+///
+/// # Safety
+/// As `pob_opt_score_batch`, but `out` must point to `3*n` doubles.
+#[no_mangle]
+pub unsafe extern "C" fn pob_opt_score_batch3(
+    pool: *mut PobOptPool,
+    ids: *const i32,
+    lengths: *const i32,
+    n: c_int,
+    out: *mut c_double,
+) -> c_int {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+        if pool.is_null() {
+            return Err("score_batch3: pool is NULL".into());
+        }
+        if n < 0 {
+            return Err("score_batch3: n is negative".into());
+        }
+        let n = n as usize;
+        if n == 0 {
+            return Ok(());
+        }
+        if lengths.is_null() || out.is_null() {
+            return Err("score_batch3: lengths or out is NULL".into());
+        }
+        if ids.is_null() {
+            return Err("score_batch3: ids is NULL".into());
+        }
+        let pool = &(*pool).pool;
+        let lengths = std::slice::from_raw_parts(lengths, n);
+
+        let mut candidates: Vec<Vec<i32>> = Vec::with_capacity(n);
+        let mut offset: usize = 0;
+        for (k, &len) in lengths.iter().enumerate() {
+            if len < 0 {
+                return Err(format!("score_batch3: candidate {k} has negative length"));
+            }
+            let len = len as usize;
+            let slice = std::slice::from_raw_parts(ids.add(offset), len);
+            candidates.push(slice.to_vec());
+            offset += len;
+        }
+
+        let triples = pool.score_batch3(&candidates);
+        debug_assert_eq!(triples.len(), n);
+        let out = std::slice::from_raw_parts_mut(out, n * 3);
+        for (k, t) in triples.iter().enumerate() {
+            out[k * 3] = t[0];
+            out[k * 3 + 1] = t[1];
+            out[k * 3 + 2] = t[2];
+        }
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(e)) => {
+            set_last_error(e);
+            1
+        }
+        Err(_) => {
+            set_last_error("pob_opt_score_batch3 panicked");
+            2
+        }
+    }
+}
+
+/// Save the optimized tree to an XML file by calling the worker's
+/// `__pob_save_optimized(packed)`. `packed` is the int array the worker unpacks:
+/// `[ n_ids, id1..idn, pathByte1..pathByteM ]` (path bytes are the UTF-8 of the
+/// output file path). `len` is the packed length. Returns 1.0 on success, 0.0 on
+/// failure, NAN if the call could not be dispatched. MUTATES a worker's spec — call
+/// once, after all scoring is done.
+///
+/// # Safety
+/// `pool` must be a live handle; `packed` must point to `len` valid int32s.
+#[no_mangle]
+pub unsafe extern "C" fn pob_opt_call_save(
+    pool: *mut PobOptPool,
+    packed: *const i32,
+    len: c_int,
+) -> c_double {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<f64, String> {
+        if pool.is_null() {
+            return Err("call_save: pool is NULL".into());
+        }
+        if len < 0 {
+            return Err("call_save: len is negative".into());
+        }
+        let len = len as usize;
+        if len > 0 && packed.is_null() {
+            return Err("call_save: packed is NULL".into());
+        }
+        let args = std::slice::from_raw_parts(packed, len);
+        Ok((*pool).pool.call_named("__pob_save_optimized", args))
+    }));
+    match result {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            set_last_error(e);
+            f64::NAN
+        }
+        Err(_) => {
+            set_last_error("pob_opt_call_save panicked");
+            f64::NAN
+        }
+    }
+}
+
 /// Copy the eligible candidate node ids (computed once at boot) into `out`,
 /// which the caller sizes to `cap` int32s. Returns the TOTAL candidate count
 /// (which may exceed `cap` — call once with cap=0/out=NULL to size, then again).

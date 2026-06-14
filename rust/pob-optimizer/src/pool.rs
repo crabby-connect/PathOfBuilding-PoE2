@@ -17,16 +17,22 @@ use std::thread::JoinHandle;
 
 /// One candidate to score: a node-id set, tagged with its index in the caller's
 /// batch so results can be reassembled in order regardless of which worker took
-/// it.
+/// it. `triple` selects the score arity: false => scalar score fn (one return,
+/// dps/ehp come back NAN); true => clean-slate fn returning (score, dps, ehp).
 struct Job {
     index: usize,
     ids: Vec<i32>,
+    triple: bool,
+    /// When set, call THIS named global (scalar return) instead of the configured
+    /// score fn. Used for one-off worker calls like saving the optimized build.
+    call_fn: Option<String>,
 }
 
-/// A scored result flowing back from a worker.
+/// A scored result flowing back from a worker. Always carries [score, dps, ehp];
+/// the scalar path fills dps/ehp with NAN (the host ignores them there).
 struct Done {
     index: usize,
-    score: f64,
+    out: [f64; 3],
 }
 
 enum Msg {
@@ -144,6 +150,20 @@ impl Pool {
     /// calls this serially (the FFI surface takes `*mut`, so the host already
     /// holds an exclusive handle). Don't call it from two host threads at once.
     pub fn score_batch(&self, candidates: &[Vec<i32>]) -> Vec<f64> {
+        self.score_batch_inner(candidates, false)
+            .into_iter()
+            .map(|t| t[0])
+            .collect()
+    }
+
+    /// Like `score_batch` but returns [score, dps, ehp] per candidate. Drives the
+    /// clean-slate score fn (3 returns), so the host's Pareto beam can prune by
+    /// both axes. Same ordering/NAN contract as `score_batch`.
+    pub fn score_batch3(&self, candidates: &[Vec<i32>]) -> Vec<[f64; 3]> {
+        self.score_batch_inner(candidates, true)
+    }
+
+    fn score_batch_inner(&self, candidates: &[Vec<i32>], triple: bool) -> Vec<[f64; 3]> {
         let n = candidates.len();
         if n == 0 {
             return Vec::new();
@@ -156,20 +176,45 @@ impl Pool {
                 .send(Msg::Job(Job {
                     index,
                     ids: ids.clone(),
+                    triple,
+                    call_fn: None,
                 }))
                 .is_err()
             {
-                return vec![f64::NAN; n];
+                return vec![[f64::NAN; 3]; n];
             }
         }
-        let mut scores = vec![f64::NAN; n];
+        let mut scores = vec![[f64::NAN; 3]; n];
         for _ in 0..n {
             match self.done_rx.recv() {
-                Ok(d) => scores[d.index] = d.score,
+                Ok(d) => scores[d.index] = d.out,
                 Err(_) => break, // all workers gone; leftover slots stay NAN
             }
         }
         scores
+    }
+
+    /// Run a one-off call to a named global on SOME worker, passing `args` as the
+    /// id-array and returning its scalar result (NAN on failure). Used for the save
+    /// step (`__pob_save_optimized`), which mutates the worker's spec — so the host
+    /// must do no further scoring on the pool afterward. Blocks for the one result.
+    pub fn call_named(&self, name: &str, args: &[i32]) -> f64 {
+        if self
+            .job_tx
+            .send(Msg::Job(Job {
+                index: 0,
+                ids: args.to_vec(),
+                triple: false,
+                call_fn: Some(name.to_string()),
+            }))
+            .is_err()
+        {
+            return f64::NAN;
+        }
+        match self.done_rx.recv() {
+            Ok(d) => d.out[0],
+            Err(_) => f64::NAN,
+        }
     }
 
     fn shutdown_internal(&self) {
@@ -238,16 +283,26 @@ fn worker_main(
             Ok(Msg::Job(j)) => j,
             Ok(Msg::Shutdown) | Err(_) => break,
         };
-        let score = match unsafe { lua.call_global_score(&score_fn, &job.ids) } {
-            Ok(s) => s,
-            // One bad candidate must not kill the worker: the Lua side already
-            // reset its stack in pop_error, so the next call starts clean.
-            Err(_) => f64::NAN,
+        // One bad candidate must not kill the worker: the Lua side already reset
+        // its stack in pop_error, so the next call starts clean (=> NAN slot).
+        let out = if let Some(fn_name) = &job.call_fn {
+            // One-off named call (e.g. save), scalar return in slot 0.
+            match unsafe { lua.call_global_score(fn_name, &job.ids) } {
+                Ok(s) => [s, f64::NAN, f64::NAN],
+                Err(_) => [f64::NAN; 3],
+            }
+        } else if job.triple {
+            unsafe { lua.call_global_score3(&score_fn, &job.ids) }.unwrap_or([f64::NAN; 3])
+        } else {
+            match unsafe { lua.call_global_score(&score_fn, &job.ids) } {
+                Ok(s) => [s, f64::NAN, f64::NAN],
+                Err(_) => [f64::NAN; 3],
+            }
         };
         if done_tx
             .send(Done {
                 index: job.index,
-                score,
+                out,
             })
             .is_err()
         {
