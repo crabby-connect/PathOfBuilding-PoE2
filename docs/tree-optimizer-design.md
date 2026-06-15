@@ -260,7 +260,8 @@ Up from the prior single-search run (`smoke_fullrun.log`: score 16.8, dps 1469.8
 Two findings worth keeping:
 - The **heap-Dijkstra (§3.2)** is the bulk of the win: 3 full searches (primary + 2 restarts) in
   *less* wall time than the old single search, and its deterministic tie-break handed the primary
-  search a better round-0 basin (−68.4 vs the old −84.8), which the diet then grew to 37.9.
+  search a better round-0 basin (−68.4 vs the old −84.8), which the diet then grew across two
+  accepted bans (−68.4 → 7.0 → 37.9) before stopping on patience (8/8).
 - The **restarts (§3.7)** did *not* win this build — band 0 already found the best basin (37.9 vs
   the restart bands' −8.4 and −10.6). They're insurance, and the `restarts_never_worsen` guarantee
   held. The bands genuinely diverge, though: restart band 2 (offset 12) landed round 0 in a 4477-dps

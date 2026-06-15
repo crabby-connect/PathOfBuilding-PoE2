@@ -257,6 +257,69 @@ end
 -- trailing chars after the ids are the BYTES of the output path (so we avoid a second FFI
 -- entry). __pob_save_optimized(packed) unpacks, saves, and returns 1.0 on success / 0.0 on
 -- failure (a number, so it flows back through call_global_score3's first return slot).
+-- ---- ATTRIBUTE-NODE ASSIGNMENT (clear STR/DEX/INT requirement warnings) ----------
+-- The beam never *chooses* the attribute on the "+5 to any Attribute" small nodes it
+-- allocates; ImportFromNodeList defaults every one to Strength (PassiveSpec.lua:937),
+-- so a Dex-hungry build ends up under-Dex and PoB shows the requirement warning. Those
+-- points are already spent — we just pick the right attribute on each.
+--
+-- spec:SwitchAttributeNode(id, idx) is the right-click action (idx 1=Str,2=Dex,3=Int);
+-- it records the choice in spec.hashOverrides, which SaveDB serializes as
+-- <AttributeOverride> (PassiveSpec.lua:296-308). Call AFTER ImportFromNodeList (the load
+-- path does the same order) and re-score to read the live deficit each step.
+--
+-- Greedy + simple (every node grants the SAME +5): walk the allocated attribute nodes,
+-- assigning each to whichever attribute is currently most under its requirement; once no
+-- attribute is short, dump the rest into the build's highest base attribute (Dex for this
+-- Monk). 5 per node, so a deficit of d needs ceil(d/5) nodes. Reports the result.
+local ATTR_NAMES = { "Str", "Dex", "Int" }   -- index matches SwitchAttributeNode idx
+local function assignAttributeNodes(hashList)
+	-- collect the allocated choosable attribute nodes (order is stable for determinism)
+	local attrNodes = {}
+	for _, id in ipairs(hashList) do
+		local node = nodeById[id]
+		if node and node.isAttribute then attrNodes[#attrNodes+1] = id end
+	end
+	if #attrNodes == 0 then return end
+	table.sort(attrNodes)
+
+	-- live attributes + requirements on the freshly-imported tree
+	local out = calcFunc({}, true)
+	local have = { out.Str or 0, out.Dex or 0, out.Int or 0 }
+	local req  = { out.ReqStr or 0, out.ReqDex or 0, out.ReqInt or 0 }
+	-- current deficit per attribute (how far below the requirement we are)
+	local deficit = {
+		math.max(0, req[1] - have[1]),
+		math.max(0, req[2] - have[2]),
+		math.max(0, req[3] - have[3]),
+	}
+	-- leftover (dump) attribute = the build's highest base attribute
+	local dumpIdx = 1
+	for i = 2, 3 do if have[i] > have[dumpIdx] then dumpIdx = i end end
+
+	local assigned = { 0, 0, 0 }
+	for _, id in ipairs(attrNodes) do
+		-- pick the still-most-deficient attribute; if none short, use the dump attribute
+		local pick, worst = dumpIdx, 0
+		for i = 1, 3 do
+			if deficit[i] > worst then worst, pick = deficit[i], i end
+		end
+		spec:SwitchAttributeNode(id, pick)
+		assigned[pick] = assigned[pick] + 1
+		deficit[pick] = math.max(0, deficit[pick] - 5)
+	end
+
+	local remaining = deficit[1] + deficit[2] + deficit[3]
+	print(string.format(
+		"  attribute nodes: %d allocated -> Str %d / Dex %d / Int %d  (dump=%s, deficit left: Str %d Dex %d Int %d)",
+		#attrNodes, assigned[1], assigned[2], assigned[3], ATTR_NAMES[dumpIdx],
+		deficit[1], deficit[2], deficit[3]))
+	if remaining > 0 then
+		print("  NOTE: " .. remaining .. " attribute points still short after spending all "
+			.. #attrNodes .. " attribute nodes — close the rest on gear/levels.")
+	end
+end
+
 function __pob_save_optimized(packed)
 	local n = packed[1] or 0
 	local hashList = {}
@@ -278,6 +341,8 @@ function __pob_save_optimized(packed)
 	local ok = pcall(function()
 		spec:ImportFromNodeList(nil, spec.curClassId, spec.curAscendClassId,
 			spec.curSecondaryAscendClassId or 0, hashList, {}, {}, {})
+		spec:BuildAllDependsAndPaths()
+		assignAttributeNodes(hashList)
 		spec:BuildAllDependsAndPaths()
 		local xmlText = build:SaveDB("optimized")
 		assert(xmlText, "SaveDB returned nil")
