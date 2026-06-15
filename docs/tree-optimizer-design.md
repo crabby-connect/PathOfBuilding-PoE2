@@ -90,10 +90,13 @@ admissible heuristic against the real calc.)
 nodes enter a solution as path cost via `node.path`, not as targets. ~hundreds of targets, not
 thousands of nodes.
 
-**3.2 Travel precompute.** Dijkstra/BFS from the allocated frontier fills point cost + the
+**3.2 Travel precompute.** Heap-based Dijkstra from the allocated frontier fills point cost + the
 traversed path for every node, obeying all connectivity rules. Re-run when the frontier changes.
 Soft-banned nodes (diet) get a high detour weight so a ban never walls off a better keystone
-behind it — routes detour, traversing a ban only as last resort.
+behind it — routes detour, traversing a ban only as last resort. This runs once per beam *state*
+per *step* (thousands of times per `run_beam`), so the frontier selection uses a `BinaryHeap` with
+lazy deletion (O(E log V)), not the old O(V²) linear min-scan — a free, behavior-preserving win the
+original cost model (§4) overlooked because it assumed `calcs.perform` dominated everything.
 
 **3.3 Power seed (one-time, before round 0).** Score every notable/keystone as a single-add from
 the start (one parallel batch) and rank by penalized power-per-point. Two uses:
@@ -142,6 +145,21 @@ the normal diet, just not unconditionally. (The normal diet requires *strict* im
 dead leaf that's only a *tie* to drop — exactly the Splinters case — slips past it; the relaxed
 accept-on-tie reclaim is what catches it.)
 
+**3.7 Multi-seed restart (local-optimum escape by re-seeding).** The diet is greedy single-node
+removal — it hill-climbs in ban-space and cannot cross a valley where the *initial basin* (which
+far cluster round 0 committed to) is itself wrong. Round 0 picks its anchors from the top
+`seed_anchors` power-ranked targets; a single bad commitment there is something no sequence of
+single bans can undo (the [smoke run](../smoke_fullrun.log) showed exactly this: round 0 landed
+in an all-EHP basin at penalized −84.8 and the 16-round diet clawed back only to +16.8, stopping
+on patience, not exhaustion). So after the primary search converges, the *whole* search (round 0 +
+diet) re-runs `restarts` more times, each seeded from the **next band** of anchors (offset
+`k·seed_anchors`), committing round 0 to structurally-different far routes. The best converged tree
+across all bands wins (`optimize`'s `run_full` closure, looped). The power seed + the cross-round
+memo are **shared** across restarts, so a restart that re-explores overlapping sets is much cheaper
+than the first. `restarts` defaults to **2** (overridable via `RESTARTS` env in `beam_ab`); 0
+restores the old single-search behavior. Skipped entirely when `seed_anchors == 0` (no perturbation
+to apply).
+
 **Score shape.** The worker returns a *growth* score `100·(wDPS·dps/refDps + wEHP·ehp/refEhp)`,
 monotonic in both axes so the beam can climb from the start-only tree. The DPS/EHP **regression
 penalty** vs. the original build is applied by the Rust beam to full-budget trees only
@@ -164,8 +182,12 @@ calls, not cheaper calls.**
 - **Parallelism:** the worker pool gives ~3.4× over single-thread on a 16-core box (scores match
   single-thread within 1e-6).
 - **Power seed cost:** ~1.2 s for all ~1,017 targets — under 1% of a multi-minute search.
+- **Pathing cost (added):** the per-state Dijkstra (§3.2) is no longer O(V²) — a heap with lazy
+  deletion makes it O(E log V). With memoization lifting the calc hit-rate to ~40%, this pure-Rust
+  pathing was a non-trivial slice of wall time the original "perform dominates" model ignored.
 
-A full-P search is still multi-minute, so the dialog must run async with progress + Cancel.
+A full-P search is still multi-minute (and the §3.7 restarts multiply the diet cost, partly offset
+by the shared seed + memo), so the dialog must run async with progress + Cancel.
 
 ---
 
@@ -210,7 +232,7 @@ cargo run --release --manifest-path rust/pob-optimizer/Cargo.toml --example beam
     -- [workers] [capPoints] [beamWidth] [outFile] [wDps] [wEhp] [penaltyK]
 # defaults: workers=auto, capPoints=0 (real budget), beamWidth=8, out=mymonk_optimized.xml,
 #           wDps=1, wEhp=1, penaltyK=5.  env: SEED_ANCHORS (default 6), MAX_JUMP_CAND (0=uncapped),
-#           PATIENCE_MAX (default 8), MAX_ROUNDS (default 40)
+#           PATIENCE_MAX (default 8), MAX_ROUNDS (default 40), RESTARTS (default 2)
 ```
 The harness prints the LIVE BASELINE (the build's own dps/ehp), runs a microbenchmark + power-seed
 cost pass, then the full beam + diet, and saves the winner to `src/Builds/<outFile>`.
@@ -226,17 +248,33 @@ The Lua-side beam also runs in the CI container via `spec/System/SpikeCleanSlate
 **Reference build: `src/Builds/mymonk.xml`** — a Monk. The file is edited between sessions, so P
 and the baseline shift; always re-measure the LIVE BASELINE before comparing.
 
-**Live baseline (2026-06-14, P=110): dps=2110.5, ehp=36,642.2.** Verified: clean-slate re-score
-of the live node set reproduces this exactly (delta −0.0 / −0.0 on both axes), so the
-`addNodes + removeCurrent` override is correct and trustworthy on both axes.
+**Live baseline (2026-06-15, P=110): dps=1942.6, ehp=30,943.1.** (Earlier sessions saw
+2110.5 / 36,642.2 — the file changed; always re-measure.) Verified historically: clean-slate
+re-score of the live node set reproduces the baseline exactly (delta −0.0 / −0.0 on both axes), so
+the `addNodes + removeCurrent` override is correct and trustworthy on both axes.
+
+**Latest result (2026-06-15, P=110, beam=8, w=1/1, K=5, restarts=2, heap-Dijkstra):**
+penalized **score=37.9, dps=1636.2, ehp=46,514.6** in **937s** (`smoke_fullrun_v2.log`).
+Up from the prior single-search run (`smoke_fullrun.log`: score 16.8, dps 1469.8, ehp 45,295.8,
+1164s) — **+126% score, +11% dps, +3% ehp, and faster despite running 3 searches instead of 1.**
+Two findings worth keeping:
+- The **heap-Dijkstra (§3.2)** is the bulk of the win: 3 full searches (primary + 2 restarts) in
+  *less* wall time than the old single search, and its deterministic tie-break handed the primary
+  search a better round-0 basin (−68.4 vs the old −84.8), which the diet then grew to 37.9.
+- The **restarts (§3.7)** did *not* win this build — band 0 already found the best basin (37.9 vs
+  the restart bands' −8.4 and −10.6). They're insurance, and the `restarts_never_worsen` guarantee
+  held. The bands genuinely diverge, though: restart band 2 (offset 12) landed round 0 in a 4477-dps
+  *all-damage* basin — the mirror image of the all-EHP trap band 0 used to fall into — so the
+  perturbation is doing real structural exploration even when it doesn't change the winner here.
 
 **Beam tunables** (`OptimizerPool:runBeam` / `BeamParams`): `capPoints` (0 = real budget),
 `beamWidth`, `maxJump`, `paretoExtra`, `detour`, `patienceMax`, `maxRounds`, `maxJumpCand`
-(0 = uncapped), `seedAnchors` (default 6), `verbose`.
+(0 = uncapped), `seedAnchors` (default 6), `restarts` (default 2, §3.7), `verbose`.
 
 **Open work:**
-1. A full P=110 seeded run against the 2110.5 / 36,642.2 baseline for a current apples-to-apples
-   result (prior full runs were at superseded budgets).
-2. Build the UI (§5) — the search and save path are done; the dialog is the remaining piece.
-3. Per-build safety re-check for `accelerate.skills` and `useFullDPS=false` on tree-granted-skill
+1. Build the UI (§5) — the search and save path are done; the dialog is the remaining piece.
+2. Per-build safety re-check for `accelerate.skills` and `useFullDPS=false` on tree-granted-skill
    or multi-skill/FullDPS builds (safe for mymonk; not universally).
+3. *Algorithm (next):* pair/swap diet moves (the remaining greedy-single-ban limitation §3.7 only
+   partly addresses), and a convergence signal in `BeamResult` (patience-stop vs. exhaustion, plus
+   round-0-to-final delta) so the UI can tell the user whether widening the beam is worth it.

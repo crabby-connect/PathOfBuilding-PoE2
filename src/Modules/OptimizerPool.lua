@@ -183,7 +183,7 @@ end
 --
 -- `params` is an optional table of beam tunables (any subset):
 --   capPoints, beamWidth, maxJump, paretoExtra, detour, patienceMax, maxRounds,
---   maxJumpCand, seedAnchors, verbose
+--   maxJumpCand, seedAnchors, restarts, verbose
 -- 0/absent keeps the Rust default (capPoints 0 => the build's real budget;
 -- maxJumpCand 0 => uncapped jumps; seedAnchors => power-seeded round-0 anchors).
 --
@@ -196,7 +196,7 @@ function OptimizerPool:runBeam(params)
 		capPoints = "cap_points", beamWidth = "beam_width", maxJump = "max_jump",
 		paretoExtra = "pareto_extra", detour = "detour", patienceMax = "patience_max",
 		maxRounds = "max_rounds", maxJumpCand = "max_jump_cand",
-		seedAnchors = "seed_anchors", verbose = "verbose",
+		seedAnchors = "seed_anchors", restarts = "restarts", verbose = "verbose",
 	}
 	local lines = { }
 	for luaKey, cKey in pairs(keyMap) do

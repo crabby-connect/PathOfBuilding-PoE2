@@ -74,6 +74,9 @@ fn main() {
     // (handy for A/B): MAX_JUMP_CAND (0=uncapped), SEED_ANCHORS (round-0 power anchors).
     let max_jump_cand: usize = std::env::var("MAX_JUMP_CAND").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let seed_anchors: usize = std::env::var("SEED_ANCHORS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+    // RESTARTS: additional perturbed-seed restarts of the whole search (each from the
+    // next anchor band) to escape a local optimum. Default 2 (matches BeamParams).
+    let restarts: usize = std::env::var("RESTARTS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
 
     let root = locate_repo_root().expect("locate repo root (need src/ + runtime/)");
     let fwd = |p: PathBuf| p.to_string_lossy().replace('\\', "/");
@@ -275,7 +278,7 @@ fn main() {
         let patience_max: usize = std::env::var("PATIENCE_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
         let max_rounds: usize = std::env::var("MAX_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
         let params = format!(
-            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max={patience_max},max_rounds={max_rounds},max_jump_cand={max_jump_cand},seed_anchors={seed_anchors},verbose=1"
+            "cap_points={cap_arg},beam_width={beam_width},max_jump=12,patience_max={patience_max},max_rounds={max_rounds},max_jump_cand={max_jump_cand},seed_anchors={seed_anchors},restarts={restarts},verbose=1"
         );
         println!("\n=== FULL BEAM + DIET via pob_opt_run_beam (P={cap_points}, beam={beam_width}) ===");
         let t_beam = Instant::now();

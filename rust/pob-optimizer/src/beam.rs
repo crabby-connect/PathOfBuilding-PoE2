@@ -135,6 +135,13 @@ pub struct BeamParams {
     /// genuinely-good far routes from step 1 instead of greedily wandering toward
     /// near EHP (the local-optimum trap the design doc hit repeatedly).
     pub seed_anchors: usize,
+    /// Number of ADDITIONAL perturbed-seed restarts of the whole search (round 0 +
+    /// diet). 0 => single search (old behavior). Each restart re-runs from a different
+    /// band of seed anchors (offset by `restart_index * seed_anchors`), so it commits
+    /// round 0 to structurally-different far routes and can escape a local optimum the
+    /// primary search settled into. The best final tree across all restarts wins. The
+    /// power seed + memo are shared, so restart N is much cheaper than the first.
+    pub restarts: usize,
     /// Print step/round progress to stdout (the example wants it; the FFI path
     /// leaves it off so a GUI host isn't spammed).
     pub verbose: bool,
@@ -155,6 +162,7 @@ impl Default for BeamParams {
             max_rounds: 40,
             max_jump_cand: 0, // 0 => uncapped
             seed_anchors: 6,
+            restarts: 2,
             verbose: false,
         }
     }
@@ -164,7 +172,7 @@ impl BeamParams {
     /// Parse a newline- or comma-delimited `key=value` override string. Unknown
     /// keys error (catch typos early); absent keys keep the default. Keys:
     /// cap_points, beam_width, max_jump, pareto_extra, detour, patience_max,
-    /// max_rounds, max_jump_cand, seed_anchors, verbose (0/1). Empty string =>
+    /// max_rounds, max_jump_cand, seed_anchors, restarts, verbose (0/1). Empty string =>
     /// all defaults.
     pub fn parse(s: &str) -> Result<BeamParams, String> {
         let mut p = BeamParams::default();
@@ -189,6 +197,7 @@ impl BeamParams {
                 "max_rounds" => p.max_rounds = num(val)?.max(0) as usize,
                 "max_jump_cand" => p.max_jump_cand = num(val)?.max(0) as usize,
                 "seed_anchors" => p.seed_anchors = num(val)?.max(0) as usize,
+                "restarts" => p.restarts = num(val)?.max(0) as usize,
                 "verbose" => p.verbose = num(val)? != 0,
                 other => return Err(format!("beam params: unknown key '{other}'")),
             }
@@ -254,7 +263,7 @@ fn compute_seed(
     detour: i64,
     memo: &mut HashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
 ) -> PowerSeed {
     let start_set: HashSet<i32> = HashSet::from([g.start]);
     // Shortest path (point cost) from the start to every reachable node, so a seed
@@ -332,124 +341,160 @@ pub fn optimize(
     // score, so the diet bans the offending nodes. (penalty_k==0 => identity.)
     let repenalize = |st: &mut State| { st.score = graph.penalized_score(st.score, st.dps, st.ehp); };
 
-    // Round 0: unconstrained.
-    log!("ROUND 0 (unconstrained)");
-    let mut best = run_beam(
-        graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
-        params.max_jump_cand, params.seed_anchors, &seed,
-        &HashSet::new(), params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
-    );
-    repenalize(&mut best);
-    log!(
-        "  round 0 best: penalized score={:.1} dps={:.1} ehp={:.1} pts={}",
-        best.score, best.dps, best.ehp, best.ids.len() - 1
-    );
+    // One full search (round 0 + the elimination diet) seeded from anchor band
+    // `anchor_offset`. Factored out so the multi-seed restart loop below can run it
+    // repeatedly from DIFFERENT anchor bands, sharing the power seed + memo, and keep
+    // the best converged tree. Returns the converged (penalized-scored) State.
+    let run_full = |anchor_offset: usize,
+                        memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+                        total_evals: &mut usize,
+                        score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>|
+     -> State {
+        // Round 0: unconstrained.
+        log!("ROUND 0 (unconstrained, anchor_offset={anchor_offset})");
+        let mut best = run_beam(
+            graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
+            params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
+            &HashSet::new(), params.detour, memo, total_evals, params.verbose, score,
+        );
+        repenalize(&mut best);
+        log!(
+            "  round 0 best: penalized score={:.1} dps={:.1} ehp={:.1} pts={}",
+            best.score, best.dps, best.ehp, best.ids.len() - 1
+        );
 
-    let mut banned: HashSet<i32> = HashSet::new();
-    let mut tried: HashSet<i32> = HashSet::new();
-    let mut patience = 0usize;
-    let mut round = 0usize;
+        let mut banned: HashSet<i32> = HashSet::new();
+        let mut tried: HashSet<i32> = HashSet::new();
+        let mut patience = 0usize;
+        let mut round = 0usize;
 
-    // Elimination diet. Each round, in order:
-    //
-    //   (a) DEAD-LEAF reclaim (batch, no patience cost). Every notable/keystone that
-    //       is a LEAF of the allocation (≤1 allocated neighbour, so it carries no
-    //       travel for any other node) AND contributes ≤0 marginal is a wasted point.
-    //       Ban ALL of them at once and re-run the full beam ONCE with the whole leaf
-    //       set excluded — one full-algo run per round, not one per dead leaf. The
-    //       leaf test is what protects the main path: a load-bearing node has ≥2
-    //       allocated neighbours and never qualifies. Accept iff the re-grown tree
-    //       does not regress (≥ best, not strictly >) — shedding dead leaves and
-    //       re-spending their points is a structural win even at a tie. No patience
-    //       tick either way; this is opportunistic cleanup, not a real probe.
-    //
-    //   (b) NORMAL ban. If no dead leaves remained, ban the single lowest-marginal
-    //       droppable node, re-optimize, keep the ban iff it strictly improved; else
-    //       revert + tick patience. Enablers (removal collapses an axis) are never
-    //       banned. Bans are SOFT: pathing may still detour through a banned node, it
-    //       just can't be targeted.
-    while round < params.max_rounds && patience < params.patience_max {
-        round += 1;
-        let marg = analyze_marginals(graph, &best, &mut memo, &mut total_evals, &mut score);
-        let droppable = |m: &&Marginal| {
-            !m.is_enabler && !banned.contains(&m.id) && !tried.contains(&m.id)
-        };
+        // Elimination diet. Each round, in order:
+        //
+        //   (a) DEAD-LEAF reclaim (batch, no patience cost). Every notable/keystone that
+        //       is a LEAF of the allocation (≤1 allocated neighbour, so it carries no
+        //       travel for any other node) AND contributes ≤0 marginal is a wasted point.
+        //       Ban ALL of them at once and re-run the full beam ONCE with the whole leaf
+        //       set excluded — one full-algo run per round, not one per dead leaf. The
+        //       leaf test is what protects the main path: a load-bearing node has ≥2
+        //       allocated neighbours and never qualifies. Accept iff the re-grown tree
+        //       does not regress (≥ best, not strictly >) — shedding dead leaves and
+        //       re-spending their points is a structural win even at a tie. No patience
+        //       tick either way; this is opportunistic cleanup, not a real probe.
+        //
+        //   (b) NORMAL ban. If no dead leaves remained, ban the single lowest-marginal
+        //       droppable node, re-optimize, keep the ban iff it strictly improved; else
+        //       revert + tick patience. Enablers (removal collapses an axis) are never
+        //       banned. Bans are SOFT: pathing may still detour through a banned node, it
+        //       just can't be targeted.
+        while round < params.max_rounds && patience < params.patience_max {
+            round += 1;
+            let marg = analyze_marginals(graph, &best, memo, total_evals, score);
+            let droppable = |m: &&Marginal| {
+                !m.is_enabler && !banned.contains(&m.id) && !tried.contains(&m.id)
+            };
 
-        // (a) Collect EVERY dead-leaf notable/keystone and shed them together. A
-        // worthless LEAF tip (notable or keystone) is a wasted point regardless of
-        // type — e.g. a notable like "Splinters" hanging off the edge whose stats do
-        // nothing for this build. The leaf test (≤1 allocated neighbour) is what keeps
-        // this safe: a load-bearing node has ≥2 allocated neighbours and never
-        // qualifies, so the main travel route is never corrupted.
-        let dead_leaves: Vec<i32> = marg
-            .iter()
-            .filter(droppable)
-            .filter(|m| {
-                matches!(graph.ty.get(&m.id), Some(&T_NOTABLE | &T_KEYSTONE))
-                    && m.marginal <= 1e-6
-                    && is_alloc_leaf(graph, &best.set, m.id)
-            })
-            .map(|m| m.id)
-            .collect();
-        if !dead_leaves.is_empty() {
+            // (a) Collect EVERY dead-leaf notable/keystone and shed them together. A
+            // worthless LEAF tip (notable or keystone) is a wasted point regardless of
+            // type — e.g. a notable like "Splinters" hanging off the edge whose stats do
+            // nothing for this build. The leaf test (≤1 allocated neighbour) is what keeps
+            // this safe: a load-bearing node has ≥2 allocated neighbours and never
+            // qualifies, so the main travel route is never corrupted.
+            let dead_leaves: Vec<i32> = marg
+                .iter()
+                .filter(droppable)
+                .filter(|m| {
+                    matches!(graph.ty.get(&m.id), Some(&T_NOTABLE | &T_KEYSTONE))
+                        && m.marginal <= 1e-6
+                        && is_alloc_leaf(graph, &best.set, m.id)
+                })
+                .map(|m| m.id)
+                .collect();
+            if !dead_leaves.is_empty() {
+                let mut trial = banned.clone();
+                trial.extend(dead_leaves.iter().copied());
+                log!("  round {round}: reclaim {} DEAD LEAF node(s) {:?}", dead_leaves.len(), dead_leaves);
+                let mut r = run_beam(
+                    graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
+                    params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
+                    &trial, params.detour, memo, total_evals, params.verbose, score,
+                );
+                repenalize(&mut r);
+                if r.score >= best.score - 1e-6 {
+                    log!("    RECLAIMED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping bans.", best.score, r.score, r.dps, r.ehp);
+                    best = r;
+                    banned = trial; // permanent: these dead leaves won't return as targets
+                    tried.clear();
+                } else {
+                    // Regressed (rare — re-fill couldn't recover): keep the bans anyway so
+                    // we don't re-detect the same dead leaves next round, but don't adopt
+                    // the worse tree. The normal diet below will work from the old best.
+                    log!("    leaf reclaim regressed ({:.1} vs {:.1}). Banning targets but keeping tree.", r.score, best.score);
+                    banned = trial;
+                }
+                continue; // one full run this round; re-analyze marginals fresh next round
+            }
+
+            // (b) No dead leaves left — normal single lowest-marginal ban.
+            let victim = marg
+                .iter()
+                .filter(droppable)
+                .min_by(|a, b| a.marginal.partial_cmp(&b.marginal).unwrap());
+            let victim = match victim {
+                Some(v) => v.clone(),
+                None => {
+                    log!("  round {round}: no untried droppable node left. Stop.");
+                    break;
+                }
+            };
+            tried.insert(victim.id);
             let mut trial = banned.clone();
-            trial.extend(dead_leaves.iter().copied());
-            log!("  round {round}: reclaim {} DEAD LEAF node(s) {:?}", dead_leaves.len(), dead_leaves);
+            trial.insert(victim.id);
+            log!("  round {round}: ban {} (marginal {:+.1})", victim.id, victim.marginal);
             let mut r = run_beam(
                 graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
-                params.max_jump_cand, params.seed_anchors, &seed,
-                &trial, params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
+                params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
+                &trial, params.detour, memo, total_evals, params.verbose, score,
             );
             repenalize(&mut r);
-            if r.score >= best.score - 1e-6 {
-                log!("    RECLAIMED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping bans.", best.score, r.score, r.dps, r.ehp);
+            if r.score > best.score + 1e-6 {
+                log!("    IMPROVED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping ban.", best.score, r.score, r.dps, r.ehp);
                 best = r;
-                banned = trial; // permanent: these dead leaves won't return as targets
+                banned = trial;
+                patience = 0;
                 tried.clear();
             } else {
-                // Regressed (rare — re-fill couldn't recover): keep the bans anyway so
-                // we don't re-detect the same dead leaves next round, but don't adopt
-                // the worse tree. The normal diet below will work from the old best.
-                log!("    leaf reclaim regressed ({:.1} vs {:.1}). Banning targets but keeping tree.", r.score, best.score);
-                banned = trial;
+                log!(
+                    "    no improvement ({:.1} vs {:.1}). Revert. patience {}/{}",
+                    r.score, best.score, patience + 1, params.patience_max
+                );
+                patience += 1;
             }
-            continue; // one full run this round; re-analyze marginals fresh next round
         }
+        best
+    };
 
-        // (b) No dead leaves left — normal single lowest-marginal ban.
-        let victim = marg
-            .iter()
-            .filter(droppable)
-            .min_by(|a, b| a.marginal.partial_cmp(&b.marginal).unwrap());
-        let victim = match victim {
-            Some(v) => v.clone(),
-            None => {
-                log!("  round {round}: no untried droppable node left. Stop.");
-                break;
+    // Primary search (anchor band 0) plus `restarts` perturbed restarts. Each restart
+    // takes the NEXT band of `seed_anchors` targets (offset by k·seed_anchors), so it
+    // commits round 0 to genuinely-different far routes and can land in a different
+    // basin than the primary search. Keep the best converged tree across all of them.
+    // The power seed + memo are shared, so a restart that re-explores overlapping sets
+    // is much cheaper than the first run. Restarts are skipped when seeding is off
+    // (seed_anchors==0) — there'd be no perturbation to apply.
+    let mut best = run_full(0, &mut memo, &mut total_evals, &mut score);
+    if params.seed_anchors > 0 {
+        for k in 1..=params.restarts {
+            let offset = k * params.seed_anchors;
+            log!("=== RESTART {k}/{} (anchor band offset {offset}) ===", params.restarts);
+            let cand = run_full(offset, &mut memo, &mut total_evals, &mut score);
+            if cand.score > best.score + 1e-6 {
+                log!(
+                    "  restart {k} WON: {:.1} -> {:.1} dps={:.1} ehp={:.1}",
+                    best.score, cand.score, cand.dps, cand.ehp
+                );
+                best = cand;
+            } else {
+                log!("  restart {k} no better ({:.1} vs {:.1})", cand.score, best.score);
             }
-        };
-        tried.insert(victim.id);
-        let mut trial = banned.clone();
-        trial.insert(victim.id);
-        log!("  round {round}: ban {} (marginal {:+.1})", victim.id, victim.marginal);
-        let mut r = run_beam(
-            graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
-            params.max_jump_cand, params.seed_anchors, &seed,
-            &trial, params.detour, &mut memo, &mut total_evals, params.verbose, &mut score,
-        );
-        repenalize(&mut r);
-        if r.score > best.score + 1e-6 {
-            log!("    IMPROVED {:.1} -> {:.1} dps={:.1} ehp={:.1}. Keeping ban.", best.score, r.score, r.dps, r.ehp);
-            best = r;
-            banned = trial;
-            patience = 0;
-            tried.clear();
-        } else {
-            log!(
-                "    no improvement ({:.1} vs {:.1}). Revert. patience {}/{}",
-                r.score, best.score, patience + 1, params.patience_max
-            );
-            patience += 1;
         }
     }
 
@@ -474,13 +519,18 @@ fn run_beam(
     pareto_extra: usize,
     max_jump_cand: usize,
     seed_anchors: usize,
+    // How many top-ranked anchor targets to SKIP before taking `seed_anchors`. 0 for
+    // the primary search; on a multi-seed restart this is `restart_index *
+    // seed_anchors`, so each restart commits round 0 to a DIFFERENT band of far
+    // routes (the local-optimum escape — see `optimize`).
+    anchor_offset: usize,
     seed: &PowerSeed,
     excluded: &HashSet<i32>,
     detour: i64,
     memo: &mut HashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
     verbose: bool,
-    score: &mut impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
 ) -> State {
     let start_set: HashSet<i32> = HashSet::from([g.start]);
     let base = score_or_memo(&[g.start], memo, total_evals, score);
@@ -511,7 +561,7 @@ fn run_beam(
         ranked.sort_by(|a, b| seed.power(b.0).partial_cmp(&seed.power(a.0)).unwrap());
 
         let mut anchor_sets: Vec<(Vec<i32>, HashSet<i32>)> = Vec::new();
-        for (tid, _) in ranked.into_iter().take(seed_anchors) {
+        for (tid, _) in ranked.into_iter().skip(anchor_offset).take(seed_anchors) {
             let path = path_to(&prev, &start_set, tid);
             if path.is_empty() {
                 continue;
@@ -703,7 +753,7 @@ fn analyze_marginals(
     best: &State,
     memo: &mut HashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
 ) -> Vec<Marginal> {
     const COLLAPSE: f64 = 0.01;
     let nodes: Vec<i32> = best
@@ -789,44 +839,53 @@ fn select_beam(sorted: Vec<State>, width: usize, extra: usize) -> Vec<State> {
 /// BFS shortest paths from a candidate id-set over the graph, honoring an optional
 /// `excluded` soft-ban (detour-weighted). Returns, for every reachable node, its
 /// point-distance (count of NEW nodes to reach it) and a `prev` map to reconstruct
-/// the path. Dijkstra with detour weight (mirrors the spike's pathsFromSet).
+/// the path. Heap-based Dijkstra with detour weight (mirrors the spike's
+/// pathsFromSet). This is called once per beam STATE per STEP, thousands of times
+/// per `run_beam`, so the frontier selection must not be the old O(V²) linear scan
+/// over `wdist` — a binary heap with lazy deletion keeps it O(E log V).
 fn paths_from_set(
     g: &Graph,
     id_set: &HashSet<i32>,
     excluded: &HashSet<i32>,
     detour: i64,
 ) -> (HashMap<i32, usize>, HashMap<i32, i32>) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
     let mut wdist: HashMap<i32, i64> = HashMap::new();
     let mut pdist: HashMap<i32, usize> = HashMap::new();
     let mut prev: HashMap<i32, i32> = HashMap::new();
     let mut visited: HashSet<i32> = HashSet::new();
+    // Min-heap keyed by weighted distance. Entries are (Reverse(weight), id); we
+    // never decrease-key, just push a fresh entry on relaxation and skip stale pops
+    // (the `visited` guard + the `w > wdist[&u]` check below). The start frontier
+    // all sits at weight 0.
+    let mut heap: BinaryHeap<Reverse<(i64, i32)>> = BinaryHeap::new();
     for &id in id_set {
         wdist.insert(id, 0);
         pdist.insert(id, 0);
+        heap.push(Reverse((0, id)));
     }
-    loop {
-        let mut u = None;
-        let mut best = i64::MAX;
-        for (&id, &w) in &wdist {
-            if !visited.contains(&id) && w < best {
-                u = Some(id);
-                best = w;
-            }
+    while let Some(Reverse((w, u))) = heap.pop() {
+        // Stale entry (a better path to u was found after this was queued), or u is
+        // already finalized: skip. This is the lazy-deletion replacement for the old
+        // linear min-scan; the first time we pop a node it carries its final weight.
+        if !visited.insert(u) {
+            continue;
         }
-        let u = match u {
-            Some(u) => u,
-            None => break,
-        };
-        visited.insert(u);
+        if wdist.get(&u).is_some_and(|&best| w > best) {
+            continue;
+        }
         if let Some(adj) = g.links.get(&u) {
             for &v in adj {
                 if !visited.contains(&v) && (id_set.contains(&v) || g.is_target(v) || v == g.start) {
-                    let w = wdist[&u] + if excluded.contains(&v) { detour } else { 1 };
-                    if wdist.get(&v).is_none_or(|&old| w < old) {
-                        wdist.insert(v, w);
+                    let nw = w + if excluded.contains(&v) { detour } else { 1 };
+                    if wdist.get(&v).is_none_or(|&old| nw < old) {
+                        wdist.insert(v, nw);
                         let pc = pdist[&u] + if id_set.contains(&v) { 0 } else { 1 };
                         pdist.insert(v, pc);
                         prev.insert(v, u);
+                        heap.push(Reverse((nw, v)));
                     }
                 }
             }
@@ -855,7 +914,7 @@ fn score_or_memo(
     ids: &[i32],
     memo: &mut HashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
 ) -> [f64; 3] {
     let key = ids.to_vec();
     if let Some(&m) = memo.get(&key) {
@@ -921,10 +980,12 @@ mod tests {
         let d = BeamParams::parse("").unwrap();
         assert_eq!(d.beam_width, 8);
         assert_eq!(d.max_jump, 12);
-        let o = BeamParams::parse("beam_width=4,max_jump=6\nverbose=1").unwrap();
+        assert_eq!(d.restarts, 2);
+        let o = BeamParams::parse("beam_width=4,max_jump=6\nverbose=1\nrestarts=0").unwrap();
         assert_eq!(o.beam_width, 4);
         assert_eq!(o.max_jump, 6);
         assert!(o.verbose);
+        assert_eq!(o.restarts, 0);
         assert!(BeamParams::parse("nope=1").is_err());
     }
 
@@ -1018,5 +1079,34 @@ mod tests {
         let res = optimize(&g, &params, score);
         assert!(res.ids.contains(&4), "seed-capped beam failed to reach the far prize: {:?}", res.ids);
         assert_eq!(res.score, 100.0);
+    }
+
+    #[test]
+    fn restarts_never_worsen_the_result() {
+        // The restart loop keeps the BEST converged tree across all anchor bands, so
+        // adding restarts must never produce a worse final score than restarts=0 on
+        // the same graph/scorer. (It can only swap in a strictly-better basin.) This
+        // is the core correctness guarantee of the multi-seed restart.
+        let g = y_graph();
+        let score = |cands: &[Vec<i32>]| -> Vec<[f64; 3]> {
+            cands
+                .iter()
+                .map(|c| {
+                    let v = if c.contains(&4) { 100.0 } else { c.len() as f64 };
+                    [v, v, v]
+                })
+                .collect()
+        };
+        let base = BeamParams {
+            cap_points: 3, beam_width: 1, max_jump: 4, pareto_extra: 0,
+            max_jump_cand: 1, seed_anchors: 1, ..Default::default()
+        };
+        let no_restart = optimize(&g, &BeamParams { restarts: 0, ..base }, score);
+        let with_restart = optimize(&g, &BeamParams { restarts: 3, ..base }, score);
+        assert!(
+            with_restart.score >= no_restart.score - 1e-9,
+            "restarts regressed the result: {} < {}",
+            with_restart.score, no_restart.score
+        );
     }
 }
