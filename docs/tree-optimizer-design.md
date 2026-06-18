@@ -98,6 +98,24 @@ per *step* (thousands of times per `run_beam`), so the frontier selection uses a
 lazy deletion (O(E log V)), not the old O(V²) linear min-scan — a free, behavior-preserving win the
 original cost model (§4) overlooked because it assumed `calcs.perform` dominated everything.
 
+Three further pure-Rust wins make this hot path allocation-light (all behavior-preserving — same
+pdist, same path, same deterministic tie-break; gated by the crate unit tests):
+- **Dense node index.** The `HashMap`-keyed `Graph` is projected once into a `NodeIndex`: an
+  ascending-id-sorted dense numbering with CSR adjacency (`adj` + `adj_off`) and per-index type
+  flags. The Dijkstra inner edge-relaxation loop indexes contiguous arrays instead of hashing an
+  `i32` per edge. Numbering by ascending id makes the heap's `(weight, index)` tie-break *identical*
+  to the old `(weight, id)` one, so the basin selection the §8 result credits is preserved exactly.
+- **Reusable scratch.** The per-call `wdist/pdist/prev/visited` `HashMap`s are gone; a `Pathfinder`
+  owns `Vec`-backed scratch sized to the node count once and clears only the *dirtied* indices each
+  call (tracked in a `dirty` list), so a Dijkstra is zero heap-allocation in steady state.
+- **Path memo (the §1a lever).** `Pathfinder` caches `(frontier-signature, excluded-signature) →
+  result`. `excluded` only changes once per diet round, so within a beam pass the key is effectively
+  the frontier; recurring frontiers across diet rounds / restarts skip the Dijkstra entirely — the
+  same call-count lever the score memo applies to the calc, now applied to the pathing the original
+  "perform dominates" model ignored. Signatures are size-folded XORs of a splitmix64 per index; a
+  collision can only ever cost a re-derived path, never corrupt a score (scores memo separately by
+  node-set). All hot integer-keyed maps/sets switched from SipHash to `FxHashMap`/`FxHashSet`.
+
 **3.3 Power seed (one-time, before round 0).** Score every notable/keystone as a single-add from
 the start (one parallel batch) and rank by penalized power-per-point. Two uses:
 - `max_jump_cand` (opt-in): cap per-state jump candidates by **real power** (keystones exempt).
@@ -184,10 +202,50 @@ calls, not cheaper calls.**
 - **Power seed cost:** ~1.2 s for all ~1,017 targets — under 1% of a multi-minute search.
 - **Pathing cost (added):** the per-state Dijkstra (§3.2) is no longer O(V²) — a heap with lazy
   deletion makes it O(E log V). With memoization lifting the calc hit-rate to ~40%, this pure-Rust
-  pathing was a non-trivial slice of wall time the original "perform dominates" model ignored.
+  pathing was a non-trivial slice of wall time the original "perform dominates" model ignored. It is
+  now also **allocation-light and memoized** (§3.2): a dense node index removes id-hashing from the
+  inner loop, a reused scratch buffer removes the four-`HashMap`-per-call allocation, and a
+  frontier-keyed path memo skips the Dijkstra when a frontier recurs across diet rounds / restarts.
 
 A full-P search is still multi-minute (and the §3.7 restarts multiply the diet cost, partly offset
 by the shared seed + memo), so the dialog must run async with progress + Cancel.
+
+**4.1 Persistent score cache (cross-run memo).** The in-run memo dies with `optimize`. Setting
+`POB_OPT_CACHE=<path>` (read by `pob_opt_run_beam`) persists it to a small binary file and warm-
+starts the next run on the **same build** from it — the common tuning loop (run, tweak, run again).
+Three design points make it safe and useful:
+- **Only raw `dps`/`ehp` are stored**, never the growth score. Col 0 is re-derived on load via
+  `Graph::growth_score` (a Rust mirror of the worker's `scoreNorm`, using the trailer weights). So a
+  re-run with **different DPS/EHP weights reuses every previously-evaluated set for free** — a fixed
+  set's raw dps/ehp don't depend on the weights. (It's not a *whole-search* hit, because different
+  weights steer the beam to explore some *different* sets; those, and only those, are calced. Measured
+  on a reduced probe: same-weights re-run = 0 new evals (7.1s → 0.1s); weights 1/1 → 3/0.2 = only
+  2056 of 4026 evals re-run.) This is why the worker's col 0 is now *recomputed* in Rust
+  (`optimize_with_memo`) instead of trusted: it decouples the cached value from the weighting.
+- The file is tagged with a **build signature** = a hash of the graph topology + budget + the
+  build's `refDps`/`refEhp` (the export trailer's first two ints), **excluding** the weight/penalty
+  ints. Any gear/skill/tree change moves the topology or the refs → signature mismatch → the stale
+  cache is silently discarded (cold start), never reused incorrectly. A corrupt/short file likewise
+  degrades to a cold start; a failed write is non-fatal. Cache code is in `src/cache.rs` (no deps,
+  little-endian); it activates only when a real trailer is present. Default (env unset) = no cache,
+  behavior identical to before.
+- **The signature MUST be order-independent.** `__pob_graph_export` emits nodes in `pairs(nodeById)`
+  order, which Lua does not keep stable across processes — a sequential hash of the flat export gives
+  a *different* signature every run, so the cache would always be discarded (the first cut hit exactly
+  this: warm-loaded 0). `build_signature` therefore parses the structure and folds each node's
+  `(id, type, sorted-links)` commutatively (XOR), so emission order can't change the result. Verified
+  identical across two separate processes (`build_sig=0x1ca4…`), and guarded by
+  `signature_is_node_order_independent`.
+
+This is **exact-set reuse only** — the "these IDs already exist, copy the score" idea. Fuzzy reuse
+(estimating an un-evaluated set from a near neighbour) is deliberately *not* done: the objective is
+non-additive (§0), so any approximated score breaks trust. Only sets that were actually calced are
+ever returned from the cache.
+
+**4.2 Memory.** The score memo is the only run-length-dependent heap consumer (the 16 worker LuaJIT
+engines are large but fixed). `pob_opt_run_beam` reports its entry count + estimated heap MB under
+`verbose=1` (`BeamResult::memo_entries` / `memo_bytes_est`) so memory/paging can be checked against
+a number rather than assumed.
 
 ---
 
@@ -237,6 +295,8 @@ cargo run --release --manifest-path rust/pob-optimizer/Cargo.toml --example beam
 The harness prints the LIVE BASELINE (the build's own dps/ehp), runs a microbenchmark + power-seed
 cost pass, then the full beam + diet, and saves the winner to `src/Builds/<outFile>`.
 Set `LIVE_IDS=<comma-separated nodes= ids>` to run the clean-slate self-consistency probe.
+Set `POB_OPT_CACHE=<path.bin>` to enable the persistent score cache (§4.1): the first run writes it,
+later runs on the same build warm-start from it (a weight-only change still hits fully).
 
 The Lua-side beam also runs in the CI container via `spec/System/SpikeCleanSlateBeam_spec.lua`
 (busted, LuaJIT) — run from the repo root with `--filter` (no explicit spec path).
@@ -253,20 +313,31 @@ and the baseline shift; always re-measure the LIVE BASELINE before comparing.
 re-score of the live node set reproduces the baseline exactly (delta −0.0 / −0.0 on both axes), so
 the `addNodes + removeCurrent` override is correct and trustworthy on both axes.
 
-**Latest result (2026-06-15, P=110, beam=8, w=1/1, K=5, restarts=2, heap-Dijkstra):**
-penalized **score=37.9, dps=1636.2, ehp=46,514.6** in **937s** (`smoke_fullrun_v2.log`).
-Up from the prior single-search run (`smoke_fullrun.log`: score 16.8, dps 1469.8, ehp 45,295.8,
-1164s) — **+126% score, +11% dps, +3% ehp, and faster despite running 3 searches instead of 1.**
-Two findings worth keeping:
-- The **heap-Dijkstra (§3.2)** is the bulk of the win: 3 full searches (primary + 2 restarts) in
-  *less* wall time than the old single search, and its deterministic tie-break handed the primary
-  search a better round-0 basin (−68.4 vs the old −84.8), which the diet then grew across two
-  accepted bans (−68.4 → 7.0 → 37.9) before stopping on patience (8/8).
+**Latest result (2026-06-15, P=110, beam=8, w=1/1, K=5, restarts=2, allocation-light pathing):**
+penalized **score=37.9, dps=1636.2, ehp=46,514.6** in **947s** (`smoke_fullrun_v3.log`).
+**Behavior-identical to the prior `smoke_fullrun_v2.log` run** — same final, same per-round
+trajectory (round 0 −68.4 → 7.0 → 37.9), same restart outcomes (band 0 wins; bands −8.4, −10.6) —
+which is exactly the point: the §3.2 dense-index / scratch-reuse / path-memo rewrite is a pure
+representation swap and reproduces the live-calc result bit-for-bit on both axes.
+
+**Honest throughput note.** The allocation-light pathing did **not** move total wall time on this
+build (947s vs 937s — flat, within noise). Once the heap-Dijkstra (O(E log V)) was already in place,
+pathing was no longer a meaningful slice of *this* search's wall clock: the ~836K calc evals across
+all three searches dominate, and the calc floor (≈8 ms/call, ~3.6× effective on 16 workers) is
+irreducible. So the §3.2 wins are best understood as **insurance, not a speedup** here — they cap
+pathing's allocation pressure and make the path memo available, which matters most on builds with a
+*higher* memo hit-rate or a *narrower* calc (where pathing's share of wall time is larger) than
+mymonk. The remaining throughput lever is still **fewer calc calls**, not faster pathing.
+
+Two search findings worth keeping (unchanged from v2, re-confirmed here):
+- The **heap-Dijkstra (§3.2)** deterministic tie-break handed the primary search a good round-0
+  basin (−68.4), which the diet grew across two accepted bans (−68.4 → 7.0 → 37.9) before stopping
+  on patience (8/8).
 - The **restarts (§3.7)** did *not* win this build — band 0 already found the best basin (37.9 vs
   the restart bands' −8.4 and −10.6). They're insurance, and the `restarts_never_worsen` guarantee
-  held. The bands genuinely diverge, though: restart band 2 (offset 12) landed round 0 in a 4477-dps
-  *all-damage* basin — the mirror image of the all-EHP trap band 0 used to fall into — so the
-  perturbation is doing real structural exploration even when it doesn't change the winner here.
+  held. The bands genuinely diverge, though: a restart band landed round 0 in a 4317-dps *all-damage*
+  basin — the mirror image of the all-EHP trap band 0 used to fall into — so the perturbation is
+  doing real structural exploration even when it doesn't change the winner here.
 
 **Beam tunables** (`OptimizerPool:runBeam` / `BeamParams`): `capPoints` (0 = real budget),
 `beamWidth`, `maxJump`, `paretoExtra`, `detour`, `patienceMax`, `maxRounds`, `maxJumpCand`

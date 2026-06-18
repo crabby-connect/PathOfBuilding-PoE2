@@ -12,6 +12,7 @@
 //! everything else is internal.
 
 pub mod beam;
+pub mod cache;
 mod config;
 mod ffi;
 mod lua;

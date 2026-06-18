@@ -55,6 +55,8 @@ beam_*.log
 spike_*.log
 smoke_*.log
 full_*.log
+cache_*.log
+optimizer_cache.bin
 *.network-response
 poe_ninja_*.json
 memory/

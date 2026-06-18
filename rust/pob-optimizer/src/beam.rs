@@ -18,11 +18,18 @@
 //!     the ban iff it improved; enablers (removal collapses an axis) are never
 //!     banned; bans are SOFT (pathing may still detour through them).
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::HashMap;
 
 pub const T_NORMAL: i32 = 1;
 pub const T_NOTABLE: i32 = 2;
 pub const T_KEYSTONE: i32 = 3;
+
+/// The search's one contact with the calc engine: score a batch of candidate id-sets,
+/// returning `[growth_score, dps, ehp]` per set in input order (NaN = reject). Threaded
+/// through every helper as `&mut dyn ScoreFn` so the beam stays engine-agnostic (the
+/// pool, a test stub, or a cache-backed closure can all satisfy it).
+type ScoreFn<'a> = dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]> + 'a;
 
 /// The tree as the worker exports it (via `__pob_graph_export`): adjacency + node
 /// types + the class start + the build's real point budget.
@@ -105,8 +112,98 @@ impl Graph {
         100.0 * (term(d_dps, self.w_dps) + term(d_ehp, self.w_ehp))
     }
 
+    /// The worker's smooth GROWTH score, recomputed in Rust from the raw dps/ehp.
+    /// Mirrors `scoreNorm` in `worker_bootstrap.lua`:
+    ///     100 * (w_dps * dps/ref_dps + w_ehp * ehp/ref_ehp)
+    /// (refs are clamped >=1 at parse, matching the Lua `math.max(...,1)`). This makes
+    /// the score a pure function of (raw dps, raw ehp) PLUS the weights/refs that live
+    /// in the graph trailer — so the persistent cache can store ONLY the weight-
+    /// independent raw dps/ehp and re-derive col 0 here. A re-run with different DPS/EHP
+    /// weights then hits the cache fully (the common tuning loop) instead of re-calcing.
+    ///
+    /// When the trailer is absent (older export => weights=1, refs=1) this is
+    /// `100*(dps+ehp)`, which is NOT what the old worker returned — but a trailer-less
+    /// export also means no ref baseline to cache against, so that path is never cached
+    /// and the beam still trusts the worker's col 0 directly (see `score_or_memo`).
+    pub fn growth_score(&self, dps: f64, ehp: f64) -> f64 {
+        100.0 * (self.w_dps * dps / self.ref_dps + self.w_ehp * ehp / self.ref_ehp)
+    }
+
+    /// Does this graph carry a real penalty/weight trailer? Only then is `growth_score`
+    /// authoritative (refs reflect the live build) and the persistent cache valid.
+    pub fn has_trailer(&self) -> bool {
+        self.penalty_k > 0.0
+    }
+
     pub fn is_target(&self, id: i32) -> bool {
         matches!(self.ty.get(&id), Some(&T_NORMAL | &T_NOTABLE | &T_KEYSTONE))
+    }
+}
+
+/// Dense node-index view of the graph, built ONCE (in `optimize`) from the
+/// `HashMap`-keyed `Graph`. The pathing hot loop (`Pathfinder::paths_from_set`,
+/// run thousands of times per `run_beam`) indexes these contiguous arrays instead
+/// of hashing `i32` ids on every edge relaxation, and reuses scratch buffers across
+/// calls instead of allocating four `HashMap`s per call.
+///
+/// `id ↔ index` is a stable dense numbering of every node. Adjacency is stored CSR-
+/// style (`adj` flat + `adj_off` offsets) so a node's neighbours are a contiguous
+/// slice. `is_target` / `is_start` are per-index bit lookups. None of this changes
+/// the search; it's a representation swap under the existing `paths_from_set`
+/// contract (same pdist, same prev, same deterministic `(weight, id)` tie-break).
+struct NodeIndex {
+    /// index -> original node id.
+    id_of: Vec<i32>,
+    /// original node id -> dense index.
+    index_of: FxHashMap<i32, u32>,
+    /// CSR adjacency: neighbours of index `i` are `adj[adj_off[i]..adj_off[i+1]]`,
+    /// stored as dense indices (not ids) so the inner loop never hashes.
+    adj: Vec<u32>,
+    adj_off: Vec<u32>,
+    /// Per-index: is this node a pathing target (Normal/Notable/Keystone)?
+    is_target: Vec<bool>,
+    /// The class start's dense index.
+    start: u32,
+}
+
+impl NodeIndex {
+    fn build(g: &Graph) -> NodeIndex {
+        // Deterministic numbering: sort ids so the index assignment (and thus every
+        // tie-break that ever touched an index) is reproducible run to run.
+        let mut ids: Vec<i32> = g.ty.keys().copied().collect();
+        ids.sort_unstable();
+        let n = ids.len();
+        let mut index_of: FxHashMap<i32, u32> = FxHashMap::default();
+        index_of.reserve(n);
+        for (i, &id) in ids.iter().enumerate() {
+            index_of.insert(id, i as u32);
+        }
+
+        let mut adj_off: Vec<u32> = Vec::with_capacity(n + 1);
+        let mut adj: Vec<u32> = Vec::new();
+        adj_off.push(0);
+        for &id in &ids {
+            if let Some(neigh) = g.links.get(&id) {
+                for &nid in neigh {
+                    // A link may point at a node not present in `ty` (shouldn't happen
+                    // on a real export, but be defensive): skip unknown neighbours.
+                    if let Some(&ni) = index_of.get(&nid) {
+                        adj.push(ni);
+                    }
+                }
+            }
+            adj_off.push(adj.len() as u32);
+        }
+
+        let is_target: Vec<bool> = ids.iter().map(|&id| g.is_target(id)).collect();
+        let start = *index_of.get(&g.start).expect("class start not in graph");
+
+        NodeIndex { id_of: ids, index_of, adj, adj_off, is_target, start }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.id_of.len()
     }
 }
 
@@ -222,13 +319,22 @@ pub struct BeamResult {
     pub ehp: f64,
     /// Total scoring calls dispatched (across all beam + diet rounds).
     pub evals: usize,
+    /// Distinct id-sets retained in the score memo at the end of the search. This is
+    /// the search's dominant heap consumer that grows with run length (the worker
+    /// LuaJIT states are large but FIXED); reported so the paging hypothesis can be
+    /// checked against a number, and so a UI can show cache size.
+    pub memo_entries: usize,
+    /// Rough heap bytes held by the score memo: the id-set keys (`len*4`) plus the
+    /// `[f64;3]` values plus per-slot table overhead. An estimate, not an allocator
+    /// measurement, but it tracks the part that grows unbounded with the search.
+    pub memo_bytes_est: usize,
 }
 
 /// A beam state: the connected allocated id-set (incl. start) plus its score.
 #[derive(Clone)]
 struct State {
     ids: Vec<i32>, // sorted, includes start
-    set: HashSet<i32>,
+    set: FxHashSet<i32>,
     score: f64,
     dps: f64,
     ehp: f64,
@@ -246,7 +352,7 @@ struct State {
 struct PowerSeed {
     /// target id -> power-per-point (higher = better value). Absent => unreachable
     /// or non-positive (treated as lowest rank).
-    ppp: HashMap<i32, f64>,
+    ppp: FxHashMap<i32, f64>,
 }
 
 impl PowerSeed {
@@ -261,24 +367,27 @@ fn compute_seed(
     g: &Graph,
     base: [f64; 3],
     detour: i64,
-    memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+    pf: &mut Pathfinder,
+    memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut ScoreFn,
 ) -> PowerSeed {
-    let start_set: HashSet<i32> = HashSet::from([g.start]);
+    let start_set: FxHashSet<i32> = FxHashSet::from_iter([g.start]);
     // Shortest path (point cost) from the start to every reachable node, so a seed
     // candidate is the start tree + the real travel path to the target (same as a
     // beam jump), and power-per-point divides by that real cost.
-    let (pdist, prev) = paths_from_set(g, &start_set, &HashSet::new(), detour);
+    let paths = pf.paths_from_set(&start_set, &FxHashSet::default(), detour);
     let base_pen = g.penalized_score(base[0], base[1], base[2]);
 
     let mut targets: Vec<(i32, Vec<i32>, usize)> = Vec::new();
-    for (&tid, &d) in &pdist {
+    for &ridx in &paths.reached {
+        let tid = pf.idx.id_of[ridx as usize];
+        let d = paths.pdist[ridx as usize];
         if d >= 1
             && tid != g.start
             && matches!(g.ty.get(&tid), Some(&T_NOTABLE | &T_KEYSTONE))
         {
-            let path = path_to(&prev, &start_set, tid);
+            let path = paths.path_to(&pf.idx, ridx);
             if path.is_empty() {
                 continue;
             }
@@ -298,7 +407,7 @@ fn compute_seed(
         }
     }
 
-    let mut ppp: HashMap<i32, f64> = HashMap::new();
+    let mut ppp: FxHashMap<i32, f64> = FxHashMap::default();
     for (tid, ids, d) in &targets {
         let sc = memo[ids];
         let pen = g.penalized_score(sc[0], sc[1], sc[2]);
@@ -315,19 +424,61 @@ fn compute_seed(
 /// Run the full beam + elimination diet. `score(&[set])` returns [score, dps, ehp]
 /// per set (NAN on failure) — the only contact with the calc engine. Memoizes by
 /// id-set across all rounds (overlapping frontiers re-produce the same sets).
+///
+/// Thin wrapper over `optimize_with_memo` with a fresh memo (no persistent cache).
 pub fn optimize(
     graph: &Graph,
     params: &BeamParams,
-    mut score: impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
 ) -> BeamResult {
+    let mut memo: FxHashMap<Vec<i32>, [f64; 3]> = FxHashMap::default();
+    optimize_with_memo(graph, params, &mut memo, score)
+}
+
+/// Like `optimize`, but the caller owns the `memo` (a `set -> [score, dps, ehp]` map):
+/// pass one preloaded from a persistent cache to start warm, and read it back after to
+/// persist. The search seeds new entries into it and reads existing ones for free.
+///
+/// CACHE CONTRACT: the persisted/seeded entries must be the RAW calc dps/ehp for the
+/// SAME build (gear/skills/tree). Col 0 (the growth score) is RE-DERIVED here from
+/// cols 1-2 via `graph.growth_score` whenever the graph carries a real trailer, so a
+/// cache built under one set of DPS/EHP weights stays valid under different weights —
+/// only `dps`/`ehp` are weight-independent, and that's all the cache needs to hold.
+pub fn optimize_with_memo(
+    graph: &Graph,
+    params: &BeamParams,
+    memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
+    mut raw_score: impl FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+) -> BeamResult {
+    // Normalize every scored triple so col 0 is ALWAYS `growth_score(dps, ehp)` when
+    // the graph has a trailer. This (a) makes weight changes cache-transparent and
+    // (b) keeps cached + freshly-calced entries on one consistent scale. Without a
+    // trailer there's no valid ref baseline, so trust the worker's col 0 as before.
+    let has_trailer = graph.has_trailer();
+    let mut score = |sets: &[Vec<i32>]| -> Vec<[f64; 3]> {
+        let mut out = raw_score(sets);
+        if has_trailer {
+            for t in &mut out {
+                if t[1].is_finite() && t[2].is_finite() {
+                    t[0] = graph.growth_score(t[1], t[2]);
+                }
+            }
+        }
+        out
+    };
+
     let (cap_points, pareto_extra) = params.resolved(graph);
-    let mut memo: HashMap<Vec<i32>, [f64; 3]> = HashMap::new();
     let mut total_evals = 0usize;
+    // Built ONCE: the dense index + reusable Dijkstra scratch + path memo, shared
+    // across the power seed, every beam pass, and every diet round / restart. This is
+    // what makes the per-state pathing allocation-free and lets recurring frontiers
+    // skip the Dijkstra (§1a/1b).
+    let mut pf = Pathfinder::new(graph);
 
     // One-time power seed (before round 0): ranks distant jump targets by REAL power
     // so the beam can escape the near-EHP local optimum. Reused across all diet rounds.
-    let seed_base = score_or_memo(&[graph.start], &mut memo, &mut total_evals, &mut score);
-    let seed = compute_seed(graph, seed_base, params.detour, &mut memo, &mut total_evals, &mut score);
+    let seed_base = score_or_memo(&[graph.start], memo, &mut total_evals, &mut score);
+    let seed = compute_seed(graph, seed_base, params.detour, &mut pf, memo, &mut total_evals, &mut score);
 
     macro_rules! log {
         ($($a:tt)*) => { if params.verbose { println!($($a)*); } };
@@ -346,16 +497,17 @@ pub fn optimize(
     // repeatedly from DIFFERENT anchor bands, sharing the power seed + memo, and keep
     // the best converged tree. Returns the converged (penalized-scored) State.
     let run_full = |anchor_offset: usize,
-                        memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+                        pf: &mut Pathfinder,
+                        memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
                         total_evals: &mut usize,
-                        score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>|
+                        score: &mut ScoreFn|
      -> State {
         // Round 0: unconstrained.
         log!("ROUND 0 (unconstrained, anchor_offset={anchor_offset})");
         let mut best = run_beam(
             graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
             params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
-            &HashSet::new(), params.detour, memo, total_evals, params.verbose, score,
+            &FxHashSet::default(), params.detour, pf, memo, total_evals, params.verbose, score,
         );
         repenalize(&mut best);
         log!(
@@ -363,8 +515,8 @@ pub fn optimize(
             best.score, best.dps, best.ehp, best.ids.len() - 1
         );
 
-        let mut banned: HashSet<i32> = HashSet::new();
-        let mut tried: HashSet<i32> = HashSet::new();
+        let mut banned: FxHashSet<i32> = FxHashSet::default();
+        let mut tried: FxHashSet<i32> = FxHashSet::default();
         let mut patience = 0usize;
         let mut round = 0usize;
 
@@ -416,7 +568,7 @@ pub fn optimize(
                 let mut r = run_beam(
                     graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
                     params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
-                    &trial, params.detour, memo, total_evals, params.verbose, score,
+                    &trial, params.detour, pf, memo, total_evals, params.verbose, score,
                 );
                 repenalize(&mut r);
                 if r.score >= best.score - 1e-6 {
@@ -453,7 +605,7 @@ pub fn optimize(
             let mut r = run_beam(
                 graph, cap_points, params.beam_width, params.max_jump, pareto_extra,
                 params.max_jump_cand, params.seed_anchors, anchor_offset, &seed,
-                &trial, params.detour, memo, total_evals, params.verbose, score,
+                &trial, params.detour, pf, memo, total_evals, params.verbose, score,
             );
             repenalize(&mut r);
             if r.score > best.score + 1e-6 {
@@ -480,12 +632,12 @@ pub fn optimize(
     // The power seed + memo are shared, so a restart that re-explores overlapping sets
     // is much cheaper than the first run. Restarts are skipped when seeding is off
     // (seed_anchors==0) — there'd be no perturbation to apply.
-    let mut best = run_full(0, &mut memo, &mut total_evals, &mut score);
+    let mut best = run_full(0, &mut pf, memo, &mut total_evals, &mut score);
     if params.seed_anchors > 0 {
         for k in 1..=params.restarts {
             let offset = k * params.seed_anchors;
             log!("=== RESTART {k}/{} (anchor band offset {offset}) ===", params.restarts);
-            let cand = run_full(offset, &mut memo, &mut total_evals, &mut score);
+            let cand = run_full(offset, &mut pf, memo, &mut total_evals, &mut score);
             if cand.score > best.score + 1e-6 {
                 log!(
                     "  restart {k} WON: {:.1} -> {:.1} dps={:.1} ehp={:.1}",
@@ -498,12 +650,22 @@ pub fn optimize(
         }
     }
 
+    // Estimate the memo's heap footprint: per entry, the Vec<i32> key bytes plus the
+    // [f64;3] value plus ~one machine word of HashMap slot overhead. The path memo on
+    // `pf` is bounded by distinct frontiers and dropped here; the score memo is the one
+    // that persists/grows, so it's the one we report.
+    let memo_entries = memo.len();
+    let key_bytes: usize = memo.keys().map(|k| k.len() * std::mem::size_of::<i32>()).sum();
+    let memo_bytes_est = key_bytes + memo_entries * (std::mem::size_of::<[f64; 3]>() + 32);
+
     BeamResult {
         ids: best.ids,
         score: best.score,
         dps: best.dps,
         ehp: best.ehp,
         evals: total_evals,
+        memo_entries,
+        memo_bytes_est,
     }
 }
 
@@ -525,14 +687,15 @@ fn run_beam(
     // routes (the local-optimum escape — see `optimize`).
     anchor_offset: usize,
     seed: &PowerSeed,
-    excluded: &HashSet<i32>,
+    excluded: &FxHashSet<i32>,
     detour: i64,
-    memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+    pf: &mut Pathfinder,
+    memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
     verbose: bool,
-    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut ScoreFn,
 ) -> State {
-    let start_set: HashSet<i32> = HashSet::from([g.start]);
+    let start_set: FxHashSet<i32> = FxHashSet::from_iter([g.start]);
     let base = score_or_memo(&[g.start], memo, total_evals, score);
     let mut beam = vec![State {
         ids: vec![g.start],
@@ -550,19 +713,23 @@ fn run_beam(
     // anchor = start tree + the shortest path to one high-power target (within budget,
     // not soft-banned). Scored in one batch with the base.
     if seed_anchors > 0 {
-        let (pdist, prev) = paths_from_set(g, &start_set, excluded, detour);
-        let mut ranked: Vec<(i32, usize)> = pdist
+        let paths = pf.paths_from_set(&start_set, excluded, detour);
+        // (tid, target-index, pdist) for every reachable, targetable, power-ranked node.
+        let mut ranked: Vec<(i32, u32, usize)> = paths
+            .reached
             .iter()
-            .filter(|(&tid, &d)| {
-                d >= 1 && d <= cap_points && tid != g.start && targetable(tid) && seed.power(tid).is_finite()
+            .filter_map(|&ridx| {
+                let tid = pf.idx.id_of[ridx as usize];
+                let d = paths.pdist[ridx as usize];
+                (d >= 1 && d <= cap_points && tid != g.start && targetable(tid) && seed.power(tid).is_finite())
+                    .then_some((tid, ridx, d))
             })
-            .map(|(&tid, &d)| (tid, d))
             .collect();
         ranked.sort_by(|a, b| seed.power(b.0).partial_cmp(&seed.power(a.0)).unwrap());
 
-        let mut anchor_sets: Vec<(Vec<i32>, HashSet<i32>)> = Vec::new();
-        for (tid, _) in ranked.into_iter().skip(anchor_offset).take(seed_anchors) {
-            let path = path_to(&prev, &start_set, tid);
+        let mut anchor_sets: Vec<(Vec<i32>, FxHashSet<i32>)> = Vec::new();
+        for (_, ridx, _) in ranked.into_iter().skip(anchor_offset).take(seed_anchors) {
+            let path = paths.path_to(&pf.idx, ridx);
             if path.is_empty() {
                 continue;
             }
@@ -593,8 +760,8 @@ fn run_beam(
 
     for step in 1..=cap_points {
         let mut cand_sets: Vec<Vec<i32>> = Vec::new();
-        let mut seen: HashSet<Vec<i32>> = HashSet::new();
-        let mut origin: Vec<(Vec<i32>, HashSet<i32>)> = Vec::new();
+        let mut seen: FxHashSet<Vec<i32>> = FxHashSet::default();
+        let mut origin: Vec<(Vec<i32>, FxHashSet<i32>)> = Vec::new();
 
         for st in &beam {
             let pts_used = st.ids.len() - 1;
@@ -607,7 +774,7 @@ fn run_beam(
                 continue;
             }
             let points_left = cap_points - pts_used;
-            let (pdist, prev) = paths_from_set(g, &st.set, excluded, detour);
+            let paths = pf.paths_from_set(&st.set, excluded, detour);
 
             // (a) single adjacent targetable nodes
             let mut moves: Vec<Vec<i32>> = Vec::new();
@@ -625,29 +792,33 @@ fn run_beam(
             // materializing paths. With max_jump_cand>0 we keep the top-K notables by
             // seed power-per-point (keystones always kept — structural value the single-
             // add seed can miss), which lets a tight cap retain FAR damage and drop junk.
-            let mut jump_targets: Vec<i32> = Vec::new();
-            for (&tid, &d) in &pdist {
+            // Collect (id, target-index) so paths can be materialized post-cap. Same
+            // predicate as before; the index lets `path_to` walk without re-hashing.
+            let mut jump_targets: Vec<(i32, u32)> = Vec::new();
+            for &ridx in &paths.reached {
+                let tid = pf.idx.id_of[ridx as usize];
+                let d = paths.pdist[ridx as usize];
                 if !st.set.contains(&tid)
                     && d >= 2
                     && d <= max_jump.min(points_left)
                     && targetable(tid)
                     && matches!(g.ty.get(&tid), Some(&T_NOTABLE | &T_KEYSTONE))
                 {
-                    jump_targets.push(tid);
+                    jump_targets.push((tid, ridx));
                 }
             }
             if max_jump_cand > 0 && jump_targets.len() > max_jump_cand {
                 let is_keystone = |id: i32| matches!(g.ty.get(&id), Some(&T_KEYSTONE));
                 // Keep all keystones; rank the rest by seed power-per-point, keep top-K.
-                let mut notables: Vec<i32> =
-                    jump_targets.iter().copied().filter(|&id| !is_keystone(id)).collect();
-                notables.sort_by(|a, b| seed.power(*b).partial_cmp(&seed.power(*a)).unwrap());
+                let mut notables: Vec<(i32, u32)> =
+                    jump_targets.iter().copied().filter(|&(id, _)| !is_keystone(id)).collect();
+                notables.sort_by(|a, b| seed.power(b.0).partial_cmp(&seed.power(a.0)).unwrap());
                 notables.truncate(max_jump_cand);
-                jump_targets.retain(|&id| is_keystone(id));
+                jump_targets.retain(|&(id, _)| is_keystone(id));
                 jump_targets.extend(notables);
             }
-            for tid in jump_targets {
-                moves.push(path_to(&prev, &st.set, tid));
+            for (_, ridx) in jump_targets {
+                moves.push(paths.path_to(&pf.idx, ridx));
             }
 
             for add in moves {
@@ -733,7 +904,7 @@ struct Marginal {
 /// neighbours is allocated? A leaf carries no travel for any other allocated node,
 /// so dropping it strands nothing; a node with ≥2 allocated neighbours may be on
 /// the main path and is structurally load-bearing. The start is never a leaf.
-fn is_alloc_leaf(g: &Graph, set: &HashSet<i32>, id: i32) -> bool {
+fn is_alloc_leaf(g: &Graph, set: &FxHashSet<i32>, id: i32) -> bool {
     if id == g.start {
         return false;
     }
@@ -751,9 +922,9 @@ fn is_alloc_leaf(g: &Graph, set: &HashSet<i32>, id: i32) -> bool {
 fn analyze_marginals(
     g: &Graph,
     best: &State,
-    memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+    memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut ScoreFn,
 ) -> Vec<Marginal> {
     const COLLAPSE: f64 = 0.01;
     let nodes: Vec<i32> = best
@@ -807,7 +978,7 @@ fn analyze_marginals(
 /// score-descending. Dedups by id-set.
 fn select_beam(sorted: Vec<State>, width: usize, extra: usize) -> Vec<State> {
     let mut out: Vec<State> = Vec::new();
-    let mut seen: HashSet<Vec<i32>> = HashSet::new();
+    let mut seen: FxHashSet<Vec<i32>> = FxHashSet::default();
     for st in &sorted {
         if out.len() >= width {
             break;
@@ -836,85 +1007,256 @@ fn select_beam(sorted: Vec<State>, width: usize, extra: usize) -> Vec<State> {
     out
 }
 
-/// BFS shortest paths from a candidate id-set over the graph, honoring an optional
-/// `excluded` soft-ban (detour-weighted). Returns, for every reachable node, its
-/// point-distance (count of NEW nodes to reach it) and a `prev` map to reconstruct
-/// the path. Heap-based Dijkstra with detour weight (mirrors the spike's
-/// pathsFromSet). This is called once per beam STATE per STEP, thousands of times
-/// per `run_beam`, so the frontier selection must not be the old O(V²) linear scan
-/// over `wdist` — a binary heap with lazy deletion keeps it O(E log V).
-fn paths_from_set(
-    g: &Graph,
-    id_set: &HashSet<i32>,
-    excluded: &HashSet<i32>,
-    detour: i64,
-) -> (HashMap<i32, usize>, HashMap<i32, i32>) {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
+/// The reachability result for one frontier: for every reached node, its
+/// point-distance and the `prev` link to reconstruct its path. Stored dense (sized
+/// to the node count) so a hit is just an array read, plus a sparse `reached` list
+/// so callers iterate only the nodes the Dijkstra actually touched. All indices are
+/// dense `NodeIndex` indices; original ids are recovered through the index.
+struct PathResult {
+    /// index -> point-distance (count of NEW, non-frontier nodes to reach it).
+    /// `usize::MAX` for unreached nodes.
+    pdist: Vec<usize>,
+    /// index -> previous index on the shortest path (`u32::MAX` = none/frontier).
+    prev: Vec<u32>,
+    /// index -> is this node part of the frontier this result was computed from
+    /// (pdist 0, the path-reconstruction stop set).
+    in_frontier: Vec<bool>,
+    /// The dense indices the search reached, in pop order (deterministic). Callers
+    /// iterate this instead of scanning all N nodes.
+    reached: Vec<u32>,
+}
 
-    let mut wdist: HashMap<i32, i64> = HashMap::new();
-    let mut pdist: HashMap<i32, usize> = HashMap::new();
-    let mut prev: HashMap<i32, i32> = HashMap::new();
-    let mut visited: HashSet<i32> = HashSet::new();
-    // Min-heap keyed by weighted distance. Entries are (Reverse(weight), id); we
-    // never decrease-key, just push a fresh entry on relaxation and skip stale pops
-    // (the `visited` guard + the `w > wdist[&u]` check below). The start frontier
-    // all sits at weight 0.
-    let mut heap: BinaryHeap<Reverse<(i64, i32)>> = BinaryHeap::new();
-    for &id in id_set {
-        wdist.insert(id, 0);
-        pdist.insert(id, 0);
-        heap.push(Reverse((0, id)));
+impl PathResult {
+    /// Reconstruct the NEW node ids on the path to `target` (target first), stopping
+    /// at the first frontier node — the index-based equivalent of the old `path_to`.
+    fn path_to(&self, idx: &NodeIndex, target: u32) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut cur = target;
+        while !self.in_frontier[cur as usize] {
+            out.push(idx.id_of[cur as usize]);
+            let p = self.prev[cur as usize];
+            if p == u32::MAX {
+                break;
+            }
+            cur = p;
+        }
+        out
     }
-    while let Some(Reverse((w, u))) = heap.pop() {
-        // Stale entry (a better path to u was found after this was queued), or u is
-        // already finalized: skip. This is the lazy-deletion replacement for the old
-        // linear min-scan; the first time we pop a node it carries its final weight.
-        if !visited.insert(u) {
-            continue;
+}
+
+/// A heap entry for the Dijkstra: `(weight, index)`. Ordered by weight then index;
+/// because `NodeIndex` numbers nodes in ascending-id order, breaking ties by index
+/// is IDENTICAL to the old `(weight, id)` tie-break — the search's deterministic
+/// basin selection (which the design doc credits for a better round-0) is preserved.
+#[derive(PartialEq, Eq)]
+struct HeapEntry(i64, u32);
+impl Ord for HeapEntry {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        // Reverse so BinaryHeap (a max-heap) pops the SMALLEST (weight, index) first.
+        o.0.cmp(&self.0).then_with(|| o.1.cmp(&self.1))
+    }
+}
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Owns the immutable `NodeIndex`, the reusable Dijkstra scratch, and the path memo.
+/// Built ONCE in `optimize` and threaded through the search so `paths_from_set`:
+///   * never re-hashes ids in the inner edge-relaxation loop (CSR index adjacency);
+///   * never allocates four `HashMap`s per call (scratch buffers cleared, not freed);
+///   * skips the Dijkstra entirely when a frontier+excluded signature recurs across
+///     diet rounds / restarts (the path memo — the same lever the score memo applies
+///     to calc calls, now applied to pure-Rust pathing the design doc flagged as a
+///     non-trivial slice of wall time).
+struct Pathfinder {
+    idx: NodeIndex,
+    /// Path memo: (frontier signature, excluded signature) -> result. The frontier
+    /// is the beam state's id-set (changes every state); `excluded` only changes once
+    /// per diet round, so within one beam pass the key is effectively the frontier.
+    memo: FxHashMap<(u64, u64), std::rc::Rc<PathResult>>,
+    // --- reusable scratch (sized to node count, cleared per miss) ---
+    wdist: Vec<i64>,
+    pdist: Vec<usize>,
+    prev: Vec<u32>,
+    in_frontier: Vec<bool>,
+    visited: Vec<bool>,
+    is_excluded: Vec<bool>,
+    heap: std::collections::BinaryHeap<HeapEntry>,
+    /// Indices touched since the last reset, so we can clear only those (not memset
+    /// the whole N-sized arrays every call).
+    dirty: Vec<u32>,
+}
+
+impl Pathfinder {
+    fn new(g: &Graph) -> Pathfinder {
+        let idx = NodeIndex::build(g);
+        let n = idx.len();
+        Pathfinder {
+            idx,
+            memo: FxHashMap::default(),
+            wdist: vec![i64::MAX; n],
+            pdist: vec![usize::MAX; n],
+            prev: vec![u32::MAX; n],
+            in_frontier: vec![false; n],
+            visited: vec![false; n],
+            is_excluded: vec![false; n],
+            heap: std::collections::BinaryHeap::new(),
+            dirty: Vec::new(),
         }
-        if wdist.get(&u).is_some_and(|&best| w > best) {
-            continue;
+    }
+
+    /// A cheap order-independent signature of a node-INDEX set (XOR of a hash per
+    /// index). Frontier and excluded sets are small and the search compares them for
+    /// exact identity, so collisions would have to hit BOTH the same XOR and the same
+    /// recompute path — negligible, and a stale hit can only ever cost a re-derived
+    /// path, never corrupt scores (the score memo is keyed separately by node-set).
+    /// We additionally fold in the set SIZE to separate same-XOR different-size sets.
+    fn signature(indices: impl Iterator<Item = u32>) -> u64 {
+        let mut sig: u64 = 0;
+        let mut count: u64 = 0;
+        for i in indices {
+            // splitmix64 finalizer — a good integer hash so XOR doesn't cancel on
+            // structured (consecutive) index sets.
+            let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            sig ^= z;
+            count += 1;
         }
-        if let Some(adj) = g.links.get(&u) {
-            for &v in adj {
-                if !visited.contains(&v) && (id_set.contains(&v) || g.is_target(v) || v == g.start) {
-                    let nw = w + if excluded.contains(&v) { detour } else { 1 };
-                    if wdist.get(&v).is_none_or(|&old| nw < old) {
-                        wdist.insert(v, nw);
-                        let pc = pdist[&u] + if id_set.contains(&v) { 0 } else { 1 };
-                        pdist.insert(v, pc);
-                        prev.insert(v, u);
-                        heap.push(Reverse((nw, v)));
-                    }
+        // Fold the set size in with an odd multiplier so same-XOR different-size sets
+        // get distinct signatures.
+        sig.wrapping_mul(0x0100_0000_0100_0001).wrapping_add(count)
+    }
+
+    /// Shortest paths from `id_set` (the beam frontier) honoring the `excluded` soft-
+    /// ban. Returns the SAME information the old free `paths_from_set` did (pdist +
+    /// prev), index-based and memoized. `id_set`/`excluded` are still id-keyed sets
+    /// (the search holds them that way); we translate to indices on the way in.
+    fn paths_from_set(
+        &mut self,
+        id_set: &FxHashSet<i32>,
+        excluded: &FxHashSet<i32>,
+        detour: i64,
+    ) -> std::rc::Rc<PathResult> {
+        // Translate the frontier + excluded id sets to dense indices (unknown ids —
+        // e.g. a banned id not in this tree — are simply skipped).
+        let frontier_idx: Vec<u32> =
+            id_set.iter().filter_map(|id| self.idx.index_of.get(id).copied()).collect();
+        let key = (
+            Self::signature(frontier_idx.iter().copied()),
+            Self::signature(excluded.iter().filter_map(|id| self.idx.index_of.get(id).copied())),
+        );
+        if let Some(hit) = self.memo.get(&key) {
+            return std::rc::Rc::clone(hit);
+        }
+
+        // --- miss: run the index-based Dijkstra into reusable scratch ---
+        // Clear only the indices dirtied by the previous run (the dense arrays are
+        // sized to N once and reused forever).
+        for &d in &self.dirty {
+            let d = d as usize;
+            self.wdist[d] = i64::MAX;
+            self.pdist[d] = usize::MAX;
+            self.prev[d] = u32::MAX;
+            self.in_frontier[d] = false;
+            self.visited[d] = false;
+            self.is_excluded[d] = false;
+        }
+        self.dirty.clear();
+        self.heap.clear();
+
+        for id in excluded {
+            if let Some(&ei) = self.idx.index_of.get(id) {
+                if !self.is_excluded[ei as usize] {
+                    self.is_excluded[ei as usize] = true;
+                    self.dirty.push(ei);
                 }
             }
         }
-    }
-    (pdist, prev)
-}
-
-/// Reconstruct the list of NEW node ids on the path to `target` (target first),
-/// stopping at the first node already in `id_set`.
-fn path_to(prev: &HashMap<i32, i32>, id_set: &HashSet<i32>, target: i32) -> Vec<i32> {
-    let mut out = Vec::new();
-    let mut cur = target;
-    while !id_set.contains(&cur) {
-        out.push(cur);
-        match prev.get(&cur) {
-            Some(&p) => cur = p,
-            None => break,
+        for &fi in &frontier_idx {
+            let fu = fi as usize;
+            if self.wdist[fu] != 0 {
+                self.wdist[fu] = 0;
+                self.pdist[fu] = 0;
+                self.in_frontier[fu] = true;
+                self.dirty.push(fi);
+                self.heap.push(HeapEntry(0, fi));
+            }
         }
+
+        let mut reached: Vec<u32> = Vec::new();
+        while let Some(HeapEntry(w, u)) = self.heap.pop() {
+            let uu = u as usize;
+            // Stale entry / already finalized: skip (lazy deletion).
+            if self.visited[uu] {
+                continue;
+            }
+            if w > self.wdist[uu] {
+                continue;
+            }
+            self.visited[uu] = true;
+            reached.push(u);
+            let pc_u = self.pdist[uu];
+            // Iterate CSR neighbours by index — no id hashing in this hot loop.
+            let lo = self.idx.adj_off[uu] as usize;
+            let hi = self.idx.adj_off[uu + 1] as usize;
+            for k in lo..hi {
+                let v = self.idx.adj[k];
+                let vu = v as usize;
+                // Frontier members, any pathing target, and the start are traversable
+                // (same predicate as before: id_set ∪ is_target ∪ start). The start is
+                // always a target, but keep the explicit guard for parity.
+                if self.visited[vu] {
+                    continue;
+                }
+                let traversable =
+                    self.in_frontier[vu] || self.idx.is_target[vu] || v == self.idx.start;
+                if !traversable {
+                    continue;
+                }
+                let nw = w + if self.is_excluded[vu] { detour } else { 1 };
+                if nw < self.wdist[vu] {
+                    if self.wdist[vu] == i64::MAX {
+                        self.dirty.push(v);
+                    }
+                    self.wdist[vu] = nw;
+                    let pc = pc_u + if self.in_frontier[vu] { 0 } else { 1 };
+                    self.pdist[vu] = pc;
+                    self.prev[vu] = u;
+                    self.heap.push(HeapEntry(nw, v));
+                }
+            }
+        }
+
+        // Snapshot the reached subset into an owned, memoizable result. Only the
+        // reached indices have valid pdist/prev/in_frontier; build dense copies (the
+        // memo holds these for the life of the search — typically modest, the reached
+        // set is the connected component, not all N).
+        let n = self.idx.len();
+        let mut pdist = vec![usize::MAX; n];
+        let mut prev = vec![u32::MAX; n];
+        let mut in_frontier = vec![false; n];
+        for &r in &reached {
+            let ru = r as usize;
+            pdist[ru] = self.pdist[ru];
+            prev[ru] = self.prev[ru];
+            in_frontier[ru] = self.in_frontier[ru];
+        }
+        let res = std::rc::Rc::new(PathResult { pdist, prev, in_frontier, reached });
+        self.memo.insert(key, std::rc::Rc::clone(&res));
+        res
     }
-    out
 }
 
 /// Score one id-set, caching by the (sorted) set. Helper for the start-only base.
 fn score_or_memo(
     ids: &[i32],
-    memo: &mut HashMap<Vec<i32>, [f64; 3]>,
+    memo: &mut FxHashMap<Vec<i32>, [f64; 3]>,
     total_evals: &mut usize,
-    score: &mut dyn FnMut(&[Vec<i32>]) -> Vec<[f64; 3]>,
+    score: &mut ScoreFn,
 ) -> [f64; 3] {
     let key = ids.to_vec();
     if let Some(&m) = memo.get(&key) {
@@ -964,15 +1306,70 @@ mod tests {
         // nodes carry travel for the far end and must NOT read as leaves (dropping
         // one would strand everything past it — "corrupt the main path").
         let g = line_graph();
-        let set: HashSet<i32> = [0, 1, 2, 3].into_iter().collect();
+        let set: FxHashSet<i32> = [0, 1, 2, 3].into_iter().collect();
         assert!(!is_alloc_leaf(&g, &set, 0), "start is never a leaf");
         assert!(!is_alloc_leaf(&g, &set, 1), "interior node is load-bearing");
         assert!(!is_alloc_leaf(&g, &set, 2), "interior node is load-bearing");
         assert!(is_alloc_leaf(&g, &set, 3), "the far end IS a droppable leaf");
         // Drop the far end: now node 2 becomes the new leaf.
-        let set2: HashSet<i32> = [0, 1, 2].into_iter().collect();
+        let set2: FxHashSet<i32> = [0, 1, 2].into_iter().collect();
         assert!(is_alloc_leaf(&g, &set2, 2));
         assert!(!is_alloc_leaf(&g, &set2, 1));
+    }
+
+    #[test]
+    fn pathfinder_pdist_paths_and_detour() {
+        // Diamond:  0 - 1 - 3      (top route, 2 hops to 3)
+        //            \       /
+        //             2 ----        (bottom route via 2, also 2 hops to 3)
+        // All notables. From the start frontier {0}, node 3 is point-distance 2 by
+        // either route; node 1 and 2 are distance 1. path_to(3) must reconstruct a
+        // real 2-node path (3 then its predecessor), stopping at the frontier.
+        let mut links = HashMap::new();
+        let mut ty = HashMap::new();
+        for id in 0..=3 {
+            ty.insert(id, T_NOTABLE);
+        }
+        links.insert(0, vec![1, 2]);
+        links.insert(1, vec![0, 3]);
+        links.insert(2, vec![0, 3]);
+        links.insert(3, vec![1, 2]);
+        let g = Graph {
+            start: 0, budget: 3, links, ty,
+            ref_dps: 1.0, ref_ehp: 1.0, w_dps: 1.0, w_ehp: 1.0, penalty_k: 0.0,
+        };
+        let mut pf = Pathfinder::new(&g);
+        // Indices are stable for the life of the Pathfinder; snapshot them up front so
+        // the assertions below don't borrow `pf` across the `&mut` pathing calls.
+        let (i0, i1, i3) = (
+            *pf.idx.index_of.get(&0).unwrap(),
+            *pf.idx.index_of.get(&1).unwrap(),
+            *pf.idx.index_of.get(&3).unwrap(),
+        );
+        let i2 = *pf.idx.index_of.get(&2).unwrap();
+        let frontier: FxHashSet<i32> = [0].into_iter().collect();
+
+        let r = pf.paths_from_set(&frontier, &FxHashSet::default(), 50);
+        assert_eq!(r.pdist[i0 as usize], 0, "frontier node is distance 0");
+        assert_eq!(r.pdist[i1 as usize], 1);
+        assert_eq!(r.pdist[i2 as usize], 1);
+        assert_eq!(r.pdist[i3 as usize], 2, "far node is 2 points away");
+        // Deterministic tie-break: index order == id order, so 3's predecessor is the
+        // lower-id route (node 1), exactly as the old (weight,id) heap chose.
+        assert_eq!(r.path_to(&pf.idx, i3), vec![3, 1], "path to 3 is [3, 1] (target-first, stops at frontier)");
+
+        // Memo identity: a repeat call with the SAME frontier+excluded returns an Rc
+        // to the same cached result (the §1a win — no second Dijkstra).
+        let r2 = pf.paths_from_set(&frontier, &FxHashSet::default(), 50);
+        assert!(std::rc::Rc::ptr_eq(&r, &r2), "repeat frontier must hit the path memo");
+        drop((r, r2));
+
+        // A soft-ban detour on node 1 must reroute the shortest path to 3 through 2
+        // (the unbanned route), since traversing 1 now costs `detour` (50) > 1.
+        let banned: FxHashSet<i32> = [1].into_iter().collect();
+        let r3 = pf.paths_from_set(&frontier, &banned, 50);
+        assert_eq!(r3.path_to(&pf.idx, i3), vec![3, 2], "banning node 1 reroutes the path to 3 via node 2");
+        assert_eq!(r3.pdist[i3 as usize], 2, "point-distance unchanged (still 2 real nodes)");
     }
 
     #[test]

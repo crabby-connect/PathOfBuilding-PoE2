@@ -340,8 +340,53 @@ pub unsafe extern "C" fn pob_opt_run_beam(
         }
         let graph = crate::beam::Graph::parse(flat);
 
+        // Optional persistent score cache (opt-in via POB_OPT_CACHE=<path>). Warm-starts
+        // the memo from a prior run of the SAME build and writes it back on completion;
+        // a weight-only change still hits fully (col 0 is re-derived). Unset => no cache,
+        // identical to the old behavior. The cache only activates with a real trailer
+        // (refs present), since the signature + growth-score recompute need it.
+        let cache_path = std::env::var_os("POB_OPT_CACHE").map(std::path::PathBuf::from);
+        let build_sig = crate::cache::build_signature(flat);
+        let mut memo = match (&cache_path, graph.has_trailer()) {
+            (Some(path), true) => crate::cache::load_with_sig(path, build_sig, &graph),
+            _ => Default::default(),
+        };
+        if beam_params.verbose {
+            if let Some(path) = &cache_path {
+                println!(
+                    "  cache: warm-loaded {} entries from {} (build_sig={:#x})",
+                    memo.len(), path.display(), build_sig
+                );
+            }
+        }
+
         // The search's only contact with the engine: batch-score via the pool.
-        let res = crate::beam::optimize(&graph, &beam_params, |cands| pool.score_batch3(cands));
+        let res = crate::beam::optimize_with_memo(&graph, &beam_params, &mut memo, |cands| {
+            pool.score_batch3(cands)
+        });
+
+        if let (Some(path), true) = (&cache_path, graph.has_trailer()) {
+            // A failed cache write must never fail the search — log to last_error slot
+            // for diagnostics but return the result regardless.
+            match crate::cache::save(path, build_sig, &memo) {
+                Ok(n) if beam_params.verbose => {
+                    println!("  cache: wrote {n} entries -> {}", path.display());
+                }
+                Ok(_) => {}
+                Err(e) => set_last_error(format!("run_beam: cache save failed (non-fatal): {e}")),
+            }
+        }
+        if beam_params.verbose {
+            // Memory signal: the score memo is the dominant run-length-dependent heap
+            // user (worker engines are large but fixed). Print it so the paging
+            // hypothesis is checkable against a number.
+            println!(
+                "  memo: {} entries, ~{:.1} MB heap; {} total calc evals",
+                res.memo_entries,
+                res.memo_bytes_est as f64 / (1024.0 * 1024.0),
+                res.evals
+            );
+        }
         Ok(res)
     }));
     match result {

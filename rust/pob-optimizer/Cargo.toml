@@ -33,3 +33,7 @@ crate-type = ["cdylib", "rlib"]
 # MUST use the exact LuaJIT the host ships (same GC, same ABI) — linking our own
 # would be a second, incompatible runtime. (Proven model from the PoC.)
 libloading = "0.8"
+# Fast non-cryptographic hashing for the search's hot integer-keyed maps/sets
+# (node-id keyed pathing scratch, memo signatures). The default SipHash is overkill
+# for trusted i32 keys; FxHashMap is a near-free 1.3–2x on these inner loops.
+rustc-hash = "2"
